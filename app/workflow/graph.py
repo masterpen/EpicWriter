@@ -2,9 +2,8 @@ from typing import TypedDict, Any
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 import asyncio
-from app.agents.core import PlannerAgent, WriterAgent, ReviewerAgent
-from app.agents.maintainer import MaintainerAgent
-from app.agents.fact_checker import FactCheckerAgent
+from app.agents.core import PlannerAgent, WriterAgent
+from app.agents.reviewer import UnifiedReviewerAgent
 from app.core.database import db
 from app.core.logger import logger
 
@@ -26,13 +25,13 @@ class NovelState(TypedDict):
     review_comments: str
     review_score: int
     generate_mode: str  # "scenes" (default) or "direct"
+    review_result: dict  # 完整审核结果（包含 maintainer 数据）
 
 # 初始化 Agent
 planner = PlannerAgent()
 writer = WriterAgent()
-reviewer = ReviewerAgent()
-maintainer = MaintainerAgent()
-fact_checker = FactCheckerAgent()
+unified_reviewer = UnifiedReviewerAgent()
+
 
 async def plan_node(state: NovelState):
     """规划节点（异步）"""
@@ -62,6 +61,7 @@ async def plan_node(state: NovelState):
         "review_count": 0,
         "review_comments": ""
     }
+
 
 async def write_node(state: NovelState):
     """写作节点（异步，支持重写模式 + 分镜并行 / 直出模式）"""
@@ -126,114 +126,130 @@ async def write_node(state: NovelState):
         logger.error(f"❌ Writer 运行致命错误: {e}")
         return {"draft": f"系统生成失败: {str(e)}"}
 
-async def review_node(state: NovelState):
-    """审核节点（异步，FactChecker + Reviewer 并行）"""
-    current_draft = state.get('draft', "")
-    book_id = state.get('book_id')
-    chapter_num = state.get('chapter_num', 1)
 
-    # ===== 异步并行：FactChecker + Reviewer =====
-    fact_result, review_result = await asyncio.gather(
-        fact_checker.acheck_facts(current_draft, book_id, chapter_num),
-        reviewer.areview_draft(current_draft, state['outline'], chapter_num, state['style']),
+async def unified_review_node(state: NovelState):
+    """
+    合并审核节点：Reviewer + FactChecker + Maintainer
+    原本 3 次 LLM 调用 → 1 次调用
+    """
+    book_id = state.get('book_id')
+    current_draft = state.get('draft', "")
+    chapter_num = state.get('chapter_num', 1)
+    style = state.get('style', "男频-热血玄幻")
+    outline = state.get('outline', {})
+
+    if not book_id or not current_draft:
+        logger.warning("⚠️ [UnifiedReviewer] 缺少必要数据，跳过审核")
+        return {"review_score": 70, "review_comments": "数据不足，默认通过", "review_count": 1}
+
+    # 获取已知角色列表（用于 Maintainer 任务）
+    current_tags_dict = await asyncio.to_thread(db.get_all_characters_dict, book_id)
+
+    # 检测是否为卷末
+    is_volume_end = False
+    next_vol_title = ""
+    try:
+        bp = await asyncio.to_thread(db.get_book_plan, book_id)
+        if bp and 'volumes' in bp:
+            volumes = bp.get('volumes', [])
+            acc = 0
+            for idx, v in enumerate(volumes):
+                vlen = v.get('estimated_chapters', 50)
+                if chapter_num <= acc + vlen:
+                    if chapter_num == acc + vlen and idx + 1 < len(volumes):
+                        is_volume_end = True
+                        next_vol_title = volumes[idx + 1].get('title', '下一卷')
+                    break
+                acc += vlen
+    except:
+        pass
+
+    if is_volume_end:
+        logger.info(f"🏁 [UnifiedReviewer] 检测到卷收尾章节 (第{chapter_num}章)")
+
+    # ===== 一次 LLM 调用完成所有审核任务 =====
+    logger.info(f"🧐 [UnifiedReviewer] 正在审核第 {chapter_num} 章...")
+
+    review_result = await unified_reviewer.review_and_analyze(
+        draft=current_draft,
+        outline=outline,
+        chapter_num=chapter_num,
+        style=style,
+        book_id=book_id,
+        current_tags_dict=current_tags_dict,
+        is_volume_end=is_volume_end,
+        next_vol_title=next_vol_title
     )
 
-    logger.debug(f"🐛 [Debug] Reviewer 返回内容: {review_result}")
-    logger.debug(f"🐛 [Debug] FactChecker 返回内容: {fact_result}")
+    # 提取结果
+    final_score = review_result.get("final_score", 70)
+    review_data = review_result.get("review", {})
+    comments = review_data.get("suggestions", review_data.get("comments", "无意见"))
 
-    if isinstance(review_result, dict):
-        score = review_result.get('score', 60)
-        comments = review_result.get('suggestions', '无意见')
-    else:
-        score = 60
-        comments = "格式解析失败，建议人工复核。"
-
-    if fact_result and fact_result.get("has_conflict"):
-        penalty = fact_result.get("penalty_score", 15)
-        score -= penalty
-        conflict_desc = " | ".join(fact_result.get("conflicts", []))
-        comments = f"【🚨事实逻辑冲突】(扣除{penalty}分): {conflict_desc}\n【编辑意见】: {comments}"
-        logger.warning(f"❌ [FactChecker] 发现逻辑漏洞，总分降至 {score}")
-
-    logger.info(f"🧐 [Editor] 最终评分: {score} | 意见: {comments[:50]}...")
+    logger.info(f"🧐 [UnifiedReviewer] 最终评分: {final_score} | 意见: {comments[:50]}...")
 
     return {
-        "review_score": score,
+        "review_score": final_score,
         "review_comments": comments,
-        "review_count": state.get("review_count", 0) + 1
+        "review_count": state.get("review_count", 0) + 1,
+        "review_result": review_result  # 保存完整结果，供后续 maintainer 使用
     }
 
-async def maintainer_node(state: NovelState):
-    """维护者节点（异步）"""
-    logger.info("🛠️ [Maintainer] 正在同步本章状态到 Neo4j 数据库...")
+
+async def archive_node(state: NovelState):
+    """
+    归档节点：将审核通过的章节保存到数据库
+    （从原 maintainer_node 拆出，只负责归档）
+    """
     book_id = state.get("book_id")
     draft = state.get("draft", "")
+    chapter_num = state.get('chapter_num', 1)
+    review_result = state.get("review_result", {})
 
-    if book_id and draft:
-        current_tags_dict = db.get_all_characters_dict(book_id)
-        
-        chapter_num = state.get('chapter_num', 1)
-        
-        # 🟢 检测是否为本卷最后一章（卷收尾标记）
-        is_volume_end = False
-        next_vol_title = ""
-        try:
-            bp = db.get_book_plan(book_id)
-            if bp and 'volumes' in bp:
-                volumes = bp.get('volumes', [])
-                acc = 0
-                for idx, v in enumerate(volumes):
-                    vlen = v.get('estimated_chapters', 50)
-                    if chapter_num <= acc + vlen:
-                        if chapter_num == acc + vlen and idx + 1 < len(volumes):
-                            is_volume_end = True
-                            next_vol_title = volumes[idx + 1].get('title', '下一卷')
-                        break
-                    acc += vlen
-        except:
-            pass
-        
-        if is_volume_end:
-            logger.info(f"🏁 [Maintainer] 检测到卷收尾章节 (第{chapter_num}章)，将生成卷收尾摘要...")
-        
-        analysis_result = await maintainer.aanalyze_status_change(
-            draft, current_tags_dict, is_volume_end=is_volume_end,
-            next_vol_title=next_vol_title, chapter_num=chapter_num
-        )
+    if not book_id or not draft:
+        return {}
 
-        outline = state.get('outline', {})
-        title = f"第{chapter_num}章"
-        if isinstance(outline, dict) and outline.get('chapter_title'):
-            title = outline['chapter_title']
+    logger.info("🛠️ [Archive] 正在归档本章到数据库...")
 
-        db.save_chapter(
-            book_id=book_id,
-            chapter_num=chapter_num,
-            title=title,
-            content=draft,
-            summary=analysis_result.get("summary", "无摘要")
-        )
-        
-        # 🟢 卷收尾：存储卷收尾上下文供下一卷 Planner 使用
-        if is_volume_end and analysis_result.get("volume_conclusion"):
-            from app.core.database import db as db2
-            conclusion_key = f"volume_conclusion_{chapter_num}"
-            db2.set_system_config(conclusion_key, analysis_result["volume_conclusion"])
+    # 从 review_result 中提取 maintainer 数据
+    maintainer_data = review_result.get("maintainer", {})
+    outline = state.get('outline', {})
+    title = f"第{chapter_num}章"
+    if isinstance(outline, dict) and outline.get('chapter_title'):
+        title = outline['chapter_title']
 
-        char_updates = analysis_result.get("character_updates", {})
-        for char_name, updates in char_updates.items():
-            mental_state = updates.get("mental_state", "正常")
-            tags = updates.get("tags", [])
-            db.update_character_state(book_id, char_name, mental_state, tags)
+    # 保存章节
+    await asyncio.to_thread(
+        db.save_chapter,
+        book_id=book_id,
+        chapter_num=chapter_num,
+        title=title,
+        content=draft,
+        summary=maintainer_data.get("summary", "无摘要")
+    )
 
-        new_entities = analysis_result.get("new_entities", [])
-        for entity in new_entities:
-            if entity.get("importance", 1) >= 2:
-                db.add_new_entity(book_id, entity)
+    # 卷收尾：存储卷收尾上下文
+    is_volume_end = maintainer_data.get("volume_conclusion") is not None
+    if is_volume_end and maintainer_data.get("volume_conclusion"):
+        conclusion_key = f"volume_conclusion_{chapter_num}"
+        await asyncio.to_thread(db.set_system_config, conclusion_key, maintainer_data["volume_conclusion"])
 
-        logger.success("✅ [Maintainer] 状态同步完成！")
+    # 更新角色状态
+    char_updates = maintainer_data.get("character_updates", {})
+    for char_name, updates in char_updates.items():
+        mental_state = updates.get("mental_state", "正常")
+        tags = updates.get("tags", [])
+        await asyncio.to_thread(db.update_character_state, book_id, char_name, mental_state, tags)
 
+    # 添加新实体
+    new_entities = maintainer_data.get("new_entities", [])
+    for entity in new_entities:
+        if entity.get("importance", 1) >= 2:
+            await asyncio.to_thread(db.add_new_entity, book_id, entity)
+
+    logger.success("✅ [Archive] 归档完成！")
     return {}
+
 
 # ==========================================
 # 3. 构建图
@@ -242,8 +258,8 @@ workflow = StateGraph(NovelState)
 
 workflow.add_node("planner", plan_node)
 workflow.add_node("writer", write_node)
-workflow.add_node("reviewer", review_node)
-workflow.add_node("maintainer", maintainer_node)
+workflow.add_node("reviewer", unified_review_node)
+workflow.add_node("archiver", archive_node)
 
 workflow.set_entry_point("planner")
 
@@ -269,7 +285,7 @@ def route_after_review(state):
             logger.success("✅ [Router] 审核通过！")
 
         if is_batch or not manual_archive:
-            return "maintainer"
+            return "archiver"
         else:
             return END
     else:
@@ -290,12 +306,12 @@ workflow.add_conditional_edges(
     route_after_review,
     {
         "writer": "writer",
-        "maintainer": "maintainer",
+        "archiver": "archiver",
         END: END
     }
 )
 
-workflow.add_edge("maintainer", END)
+workflow.add_edge("archiver", END)
 
 # ==========================================
 # 4. 编译
