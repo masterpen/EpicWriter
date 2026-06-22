@@ -1,0 +1,16 @@
+{
+  "title": { "text": "四组消融实验核心指标对比", "left": "center", "textStyle": { "fontSize": 14 } },
+  "tooltip": { "trigger": "axis" },
+  "legend": { "data": ["G1 Baseline", "G2 NoGraph", "G3 NoMask", "G4 Proposed"], "bottom": 10 },
+  "xAxis": {
+    "type": "category",
+    "data": ["剧情连贯性", "人设一致性", "文笔流畅度", "ECR(%)"]
+  },
+  "yAxis": { "type": "value", "max": 100 },
+  "series": [
+    { "name": "G1 Baseline", "type": "bar", "data": [2.10, 1.80, 3.20, 61.2], "itemStyle": { "color": "#d0d0d0" } },
+    { "name": "G2 NoGraph", "type": "bar", "data": [3.40, 3.20, 3.50, 82.5], "itemStyle": { "color": "#a0a0a0" } },
+    { "name": "G3 NoMask", "type": "bar", "data": [3.80, 3.50, 3.60, 78.3], "itemStyle": { "color": "#707070" } },
+    { "name": "G4 Proposed", "type": "bar", "data": [4.60, 4.50, 3.80, 96.1], "itemStyle": { "color": "#333333" } }
+  ]
+}
