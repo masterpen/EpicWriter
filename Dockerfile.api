@@ -1,21 +1,39 @@
-# Use an official Python runtime as a parent image
-FROM python:3.11-slim
+# ===== Stage 1: builder =====
+FROM python:3.11-slim AS builder
 
-# Set the working directory in the container
 WORKDIR /app
 
-# Copy the current directory contents into the container at /app
-COPY . /app
+# 仅复制依赖清单，最大化利用层缓存
+COPY requirements.txt .
 
-# Install any needed packages specified in requirements.txt
-# If requirements.txt doesn't exist, we install manually
-RUN pip install --no-cache-dir fastapi uvicorn[standard] neo4j langchain langgraph langchain-openai pydantic-settings loguru requests pyjwt email-validator
+# 安装到独立 prefix，便于第二阶段拷贝
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-# Make port 8000 available to the world outside this container
+# ===== Stage 2: runtime =====
+FROM python:3.11-slim
+
+# 创建非 root 用户
+RUN groupadd -r app && useradd -r -g app -d /app -s /sbin/nologin app
+
+WORKDIR /app
+
+# 拷贝依赖
+COPY --from=builder /install /usr/local
+
+# 拷贝应用代码
+COPY api ./api
+COPY app ./app
+COPY scripts ./scripts
+
+# 运行时数据目录（日志、sqlite 检查点等）
+RUN mkdir -p /app/data /app/logs && chown -R app:app /app
+
+ENV PYTHONPATH=/app \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+USER app
+
 EXPOSE 8000
 
-# Define environment variable
-ENV PYTHONPATH=/app
-
-# Run app.py when the container launches
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
