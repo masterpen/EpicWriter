@@ -69,7 +69,7 @@ class DatabaseManager:
                 WHERE b.user_id = $uid OR $uid IS NULL OR $uid = ''
                 RETURN b.book_id, b.title, b.created_at 
                 ORDER BY b.created_at DESC
-            """, uid=user_id)
+            """, parameters={'uid': user_id})
         return self.query("""
             MATCH (b:Book) 
             RETURN b.book_id, b.title, b.created_at 
@@ -294,7 +294,8 @@ class DatabaseManager:
                 try:
                     import json
                     volumes_data = json.loads(raw_volumes)
-                except:
+                except json.JSONDecodeError as e:
+                    logger.warning(f"[DB] volumes JSON 解析失败 (book_id={book_id}): {e}")
                     volumes_data = []
             
             # 拼装 Config
@@ -328,7 +329,8 @@ class DatabaseManager:
                 # 或者在这里 load 好。为了方便 Planner，这里直接 load。
                 try:
                     volumes_list = json.loads(record["bp.volumes"])
-                except:
+                except json.JSONDecodeError as e:
+                    logger.warning(f"[DB] book_plan volumes JSON 解析失败 (book_id={book_id}): {e}")
                     volumes_list = []
                     
                 return {
@@ -632,8 +634,234 @@ class DatabaseManager:
                     WITH i, b
                     MATCH (b)-[:EXIST_IN]->(c:Character {name: $owner})
                     MERGE (c)-[:POSSESSES]->(i)
-                """, bid=book_id, name=entity.get("name"), desc=entity.get("desc", ""), 
+                """, bid=book_id, name=entity.get("name"), desc=entity.get("desc", ""),
                      importance=entity.get("importance", 1), owner=entity.get("owner", "主角"))
+
+    # =======================
+    # User 管理（认证系统）
+    # =======================
+
+    def create_user(self, user_id: str, username: str, email: str, password_hash: str, salt: str) -> bool:
+        """创建用户节点，返回是否成功（用户名唯一时返回 True，已存在返回 False）"""
+        with self.driver.session() as session:
+            existing = session.run(
+                "MATCH (u:User {username: $username}) RETURN u.user_id AS uid",
+                username=username,
+            ).single()
+            if existing:
+                return False
+            session.run(
+                """
+                CREATE (u:User {
+                    user_id: $user_id,
+                    username: $username,
+                    email: $email,
+                    password_hash: $password_hash,
+                    salt: $salt,
+                    created_at: datetime()
+                })
+                """,
+                user_id=user_id,
+                username=username,
+                email=email,
+                password_hash=password_hash,
+                salt=salt,
+            )
+            return True
+
+    def get_user_by_username(self, username: str) -> dict | None:
+        """按用户名查询用户，返回 dict 或 None"""
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (u:User {username: $username})
+                RETURN u.user_id AS user_id,
+                       u.username AS username,
+                       u.email AS email,
+                       u.password_hash AS password_hash,
+                       u.salt AS salt
+                """,
+                username=username,
+            ).single()
+            if not result:
+                return None
+            return {
+                "user_id": result["user_id"],
+                "username": result["username"],
+                "email": result["email"],
+                "password_hash": result["password_hash"],
+                "salt": result["salt"],
+            }
+
+    def get_user_by_id(self, user_id: str) -> dict | None:
+        """按 user_id 查询用户，返回 dict 或 None"""
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (u:User {user_id: $user_id})
+                RETURN u.user_id AS user_id,
+                       u.username AS username,
+                       u.email AS email
+                """,
+                user_id=user_id,
+            ).single()
+            if not result:
+                return None
+            return {
+                "user_id": result["user_id"],
+                "username": result["username"],
+                "email": result["email"],
+            }
+
+    # ==============================================================================
+    # 🎙️ 创作访谈 (Creative Interview)
+    # ==============================================================================
+
+    def create_interview_session(self, session_id, user_id, raw_idea, style):
+        """创建访谈会话节点"""
+        with self.driver.session() as session:
+            session.run("""
+                CREATE (s:InterviewSession {
+                    session_id: $sid,
+                    user_id: $user_id,
+                    raw_idea: $raw_idea,
+                    style: $style,
+                    status: 'active',
+                    started_at: datetime(),
+                    collected_constraints: '{}',
+                    question_history: '[]',
+                    current_topic: ''
+                })
+            """, sid=session_id, user_id=user_id or "", raw_idea=raw_idea, style=style)
+
+    def get_interview_session(self, session_id):
+        """获取访谈会话状态（JSON 字段自动解析）"""
+        result = self.query("""
+            MATCH (s:InterviewSession {session_id: $sid})
+            RETURN s
+        """, parameters={'sid': session_id})
+        if not result:
+            return None
+        s = result[0]['s']
+        return {
+            "session_id": s.get('session_id'),
+            "user_id": s.get('user_id', ''),
+            "raw_idea": s.get('raw_idea', ''),
+            "style": s.get('style', ''),
+            "status": s.get('status', 'active'),
+            "current_topic": s.get('current_topic', ''),
+            "collected_constraints": json.loads(s.get('collected_constraints', '{}') or '{}'),
+            "question_history": json.loads(s.get('question_history', '[]') or '[]'),
+        }
+
+    def update_interview_session(self, session_id, status=None, current_topic=None,
+                                 collected_constraints=None, question_history=None):
+        """更新访谈会话字段（传 None 的字段不更新）"""
+        sets = []
+        params = {'sid': session_id}
+        if status is not None:
+            sets.append("s.status = $status")
+            params['status'] = status
+        if current_topic is not None:
+            sets.append("s.current_topic = $topic")
+            params['topic'] = current_topic
+        if collected_constraints is not None:
+            sets.append("s.collected_constraints = $constraints")
+            params['constraints'] = json.dumps(collected_constraints, ensure_ascii=False)
+        if question_history is not None:
+            sets.append("s.question_history = $history")
+            params['history'] = json.dumps(question_history, ensure_ascii=False)
+        if not sets:
+            return
+        cypher = f"MATCH (s:InterviewSession {{session_id: $sid}}) SET {', '.join(sets)}"
+        with self.driver.session() as session:
+            session.run(cypher, **params)
+
+    # ==============================================================================
+    # 🎴 多方案竞争 (Bible Variants)
+    # ==============================================================================
+
+    def save_bible_variants(self, session_id, variants):
+        """把多方案竞争结果挂到访谈会话下（:BibleVariant 节点）"""
+        with self.driver.session() as session:
+            # 先清空旧的 variants，避免重复
+            session.run("""
+                MATCH (s:InterviewSession {session_id: $sid})-[:HAS_VARIANT]->(v:BibleVariant)
+                DETACH DELETE v
+            """, sid=session_id)
+            for v in variants:
+                session.run("""
+                    MATCH (s:InterviewSession {session_id: $sid})
+                    CREATE (v:BibleVariant {
+                        session_id: $sid,
+                        label: $label,
+                        seed: $seed,
+                        core_setting: $core_setting,
+                        strengths: $strengths,
+                        risks: $risks,
+                        user_decision: 'pending'
+                    })
+                    MERGE (s)-[:HAS_VARIANT]->(v)
+                """, sid=session_id, label=v.get('label', ''),
+                     seed=v.get('seed', ''),
+                     core_setting=json.dumps(v.get('core_setting', {}), ensure_ascii=False),
+                     strengths=json.dumps(v.get('strengths', []), ensure_ascii=False),
+                     risks=json.dumps(v.get('risks', []), ensure_ascii=False))
+
+    def get_bible_variants(self, session_id):
+        """获取会话下的所有方案"""
+        result = self.query("""
+            MATCH (s:InterviewSession {session_id: $sid})-[:HAS_VARIANT]->(v:BibleVariant)
+            RETURN v ORDER BY v.label
+        """, parameters={'sid': session_id})
+        variants = []
+        for r in result:
+            v = r['v']
+            variants.append({
+                "label": v.get('label', ''),
+                "seed": v.get('seed', ''),
+                "core_setting": json.loads(v.get('core_setting', '{}') or '{}'),
+                "strengths": json.loads(v.get('strengths', '[]') or '[]'),
+                "risks": json.loads(v.get('risks', '[]') or '[]'),
+                "user_decision": v.get('user_decision', 'pending'),
+            })
+        return variants
+
+    def set_variant_decision(self, session_id, label, decision):
+        """记录用户对某方案的决策（chosen/rejected/merged）"""
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (s:InterviewSession {session_id: $sid})-[:HAS_VARIANT]->(v:BibleVariant {label: $label})
+                SET v.user_decision = $decision
+            """, sid=session_id, label=label, decision=decision)
+
+    def mark_interview_completed_with_book(self, session_id, book_id):
+        """访谈完成后关联到书籍（可选）"""
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (s:InterviewSession {session_id: $sid})
+                MATCH (b:Book {book_id: $bid})
+                MERGE (s)-[:RESULTED_IN]->(b)
+            """, sid=session_id, bid=book_id)
+
+    def save_interview_bible_draft(self, session_id, bible_draft):
+        """保存访谈生成的 Bible 草稿（decide 后、confirm 前）"""
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (s:InterviewSession {session_id: $sid})
+                SET s.bible_draft = $draft,
+                    s.bible_draft_at = datetime()
+            """, sid=session_id, draft=json.dumps(bible_draft, ensure_ascii=False))
+
+    def get_interview_bible_draft(self, session_id):
+        """获取访谈生成的 Bible 草稿"""
+        result = self.query("""
+            MATCH (s:InterviewSession {session_id: $sid})
+            RETURN s.bible_draft AS draft
+        """, parameters={'sid': session_id})
+        if not result or not result[0].get('draft'):
+            return None
+        return json.loads(result[0]['draft'])
 
 # 创建全局实例
 db = DatabaseManager()

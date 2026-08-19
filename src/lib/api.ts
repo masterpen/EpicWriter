@@ -19,19 +19,21 @@ export function clearAuth(): void {
 }
 
 async function fetchApi<T>(endpoint: string, options?: RequestInit): Promise<T> {
+  const token = getToken();
   const response = await fetch(`${API_BASE_URL}${endpoint}`, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...options?.headers,
     },
   });
-  
+
   if (!response.ok) {
     const error = await response.json().catch(() => ({ detail: 'API Error' }));
     throw new Error(error.detail || `API Error: ${response.status}`);
   }
-  
+
   return response.json();
 }
 
@@ -68,12 +70,12 @@ export const api = {
     fetchApi<AuthUser>('/auth/me'),
   
   // Books
-  getAllBooks: () => fetchApi<{ books: any[] }>('/books'),
+  getAllBooks: () => fetchApi<{ books: any[] }>('/books/'),
   
   getBook: (bookId: string) => fetchApi<any>(`/books/${bookId}`),
   
   createBook: (title: string) => 
-    fetchApi<{ book_id: string }>('/books', {
+    fetchApi<{ book_id: string }>('/books/', {
       method: 'POST',
       body: JSON.stringify({ title }),
     }),
@@ -93,6 +95,54 @@ export const api = {
     fetchApi<{ book_id: string }>('/books/genesis', {
       method: 'POST',
       body: JSON.stringify({ idea, target_chapters: targetChapters, style }),
+    }),
+  
+  // Books - Creative Interview (Phase 1)
+  startInterview: (rawIdea: string, style: string) =>
+    fetchApi<{ session_id: string; question: any; progress: number }>('/books/interview/start', {
+      method: 'POST',
+      body: JSON.stringify({ raw_idea: rawIdea, style }),
+    }),
+  
+  answerInterview: (sessionId: string, questionId: string, answer: { option_value?: string; free_input?: string }) =>
+    fetchApi<{ question: any; progress: number; completed: boolean }>(`/books/interview/${sessionId}/answer`, {
+      method: 'POST',
+      body: JSON.stringify({ question_id: questionId, answer }),
+    }),
+  
+  skipInterview: (sessionId: string) =>
+    fetchApi<{ question: any; progress: number; completed: boolean }>(`/books/interview/${sessionId}/skip`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+  
+  completeInterview: (sessionId: string) =>
+    fetchApi<{ session_id: string; constraints: Record<string, string>; raw_idea: string; style: string; coverage: number }>(
+      `/books/interview/${sessionId}/complete`,
+      { method: 'POST', body: JSON.stringify({}) }
+    ),
+  
+  generateVariants: (sessionId: string, constraints: Record<string, string>, style: string, n?: number) =>
+    fetchApi<{ session_id: string; variants: any[] }>(`/books/interview/${sessionId}/variants/generate`, {
+      method: 'POST',
+      body: JSON.stringify({ constraints, style, n: n || 3 }),
+    }),
+  
+  decideVariant: (sessionId: string, decision: string, chosen?: string, merge?: string[], totalChapters?: number) =>
+    fetchApi<{ session_id: string; draft: any; title: string }>(`/books/interview/${sessionId}/variants/decide`, {
+      method: 'POST',
+      body: JSON.stringify({
+        decision,
+        chosen,
+        merge,
+        total_chapters: totalChapters || 100,
+      }),
+    }),
+  
+  confirmBible: (sessionId: string) =>
+    fetchApi<{ book_id: string; title: string }>(`/books/interview/${sessionId}/bible/confirm`, {
+      method: 'POST',
+      body: JSON.stringify({}),
     }),
   
   // World Config

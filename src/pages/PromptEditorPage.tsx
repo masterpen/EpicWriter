@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { api } from '@/lib/api';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
-import { ChevronLeft, Save, RotateCcw, Code2, MessageSquare, Edit3, Eye, EyeOff } from 'lucide-react';
+import { ChevronLeft, Save, RotateCcw, Code2, MessageSquare, Eye, EyeOff } from 'lucide-react';
 
 interface PromptStage {
   key: string;

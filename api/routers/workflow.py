@@ -84,27 +84,32 @@ async def approve_outline(req: OutlineUpdateRequest):
 @router.post("/analyze")
 async def analyze_draft(req: ChapterSaveRequest, book_id: str):
     """使用 UnifiedReviewer 进行分析（替代旧的 MaintainerAgent）"""
-    reviewer = UnifiedReviewerAgent()
+    from app.core.logger import logger
+    try:
+        reviewer = UnifiedReviewerAgent()
 
-    all_chars = await asyncio.to_thread(db.get_all_characters_dict, book_id)
-    filtered_context = {k: v for k, v in all_chars.items() if k in req.content}
+        all_chars = await asyncio.to_thread(db.get_all_characters_dict, book_id)
+        filtered_context = {k: v for k, v in all_chars.items() if k in req.content}
 
-    print(f"📊 [Analyze] book_id={book_id}, content_length={len(req.content or '')}, chars_count={len(all_chars)}")
+        logger.info(f"[Analyze] book_id={book_id}, content_length={len(req.content or '')}, chars_count={len(all_chars)}")
 
-    # 使用 UnifiedReviewer 的 review_and_analyze 方法
-    result = await reviewer.review_and_analyze(
-        draft=req.content,
-        outline={},  # 独立分析模式，无大纲
-        chapter_num=1,  # 默认值
-        style="男频-热血玄幻",  # 默认值
-        book_id=book_id,
-        current_tags_dict=filtered_context
-    )
+        # 使用 UnifiedReviewer 的 review_and_analyze 方法
+        result = await reviewer.review_and_analyze(
+            draft=req.content,
+            outline={},  # 独立分析模式，无大纲
+            chapter_num=1,  # 默认值
+            style="男频-热血玄幻",  # 默认值
+            book_id=book_id,
+            current_tags_dict=filtered_context
+        )
 
-    print(f"📊 [Analyze] result={result}")
+        logger.info(f"[Analyze] result keys={list(result.keys()) if isinstance(result, dict) else type(result)}")
 
-    # 返回 maintainer 部分的结果（保持 API 兼容）
-    return result.get("maintainer", {})
+        # 返回 maintainer 部分的结果（保持 API 兼容）
+        return result.get("maintainer", {})
+    except Exception as e:
+        logger.exception(f"[Analyze] 失败 book_id={book_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"分析失败: {e}")
 
 @router.post("/chapters/archive")
 async def archive_chapter(book_id: str, req: ChapterArchiveRequest):
