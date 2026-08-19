@@ -1,9 +1,17 @@
 import os
 import json
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from app.core.logger import logger
 
-PROMPT_CONFIG_FILE = "logs/prompt_overrides.json"  # persist in logs dir for simplicity
+# 配置文件迁移到独立的数据/配置目录，不再混入 logs/
+PROMPT_CONFIG_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "data", "config", "prompt_overrides.json"
+)
+
+# 模块级缓存：避免每次 get_prompt 都读文件
+# (mtime, overrides) — mtime 用于检测文件是否被外部修改
+_overrides_cache: Tuple[float, Dict] = (0.0, {})
 
 DEFAULT_PROMPTS: Dict[str, Dict[str, str]] = {
     "brainstorm": {
@@ -30,7 +38,7 @@ DEFAULT_PROMPTS: Dict[str, Dict[str, str]] = {
 ]"""
     },
     "plan": {
-        "system": "你是一个精通各类网文结构的剧情策划大师，擅长把握节奏、伏笔和高潮设计。",
+        "system": "你是一个精通各类网文结构的剧情策划大师，擅长把握节奏、伏笔和高潮设计。你策划每一章时首先考虑的不是\"发生什么\"，而是\"读者读完这一章会想知道什么\"。",
         "template": """任务：设计第 {chapter_num} 章的【分镜大纲】。
 
 {opening_instruction}
@@ -85,6 +93,10 @@ DEFAULT_PROMPTS: Dict[str, Dict[str, str]] = {
 请严格返回以下 JSON 格式，不要包含 Markdown 代码块标记：
 {{
     "chapter_title": "本章标题 (双关/悬念感)",
+    "reader_objective": "本章结束后，读者应该知道了什么、还想知道什么（阅读目标）",
+    "character_goal": "本章主角的具体欲望目标（他想得到/做到什么）",
+    "dilemma": "主角面临的两难/危险选择",
+    "choice_cost": "主角做出选择所付出的代价",
     "scenes": [
         {{
             "beat_type": "类型 (如：危机引入 / 智斗博弈 / 高潮爆发 / 盘点收获)",
@@ -99,6 +111,9 @@ DEFAULT_PROMPTS: Dict[str, Dict[str, str]] = {
              // 分镜 3 ...
         }}
     ],
+    "information_reveal": "本章揭示的核心信息，以及向谁揭示（读者/主角/双方）",
+    "irreversible_change": "本章结束后不可逆的改变（拒绝一切照旧）",
+    "chapter_hook": "章末钩子 = 新信息 + 风险/悬念 + 下一步行动方向",
     "pacing_note": "本章节奏说明 (如何分配详略，哪里快哪里慢)"
 }}"""
     },
@@ -127,9 +142,12 @@ DEFAULT_PROMPTS: Dict[str, Dict[str, str]] = {
 >>> {scene} <<<
 
 【⚡ 写作要求】
-1. 动作和对话驱动：用动作/对话推进，不要静态心理描写
-2. 环境描写极限1句，且仅限场景开头，禁止景物堆砌
+1. 动作和对话驱动：用动作/对话推进，避免大段静态心理描写；但主角面临关键选择时，允许1-2句内心权衡（体现代价感）
+2. 环境描写服务于情绪与氛围，单场景不超过2句，禁止与剧情无关的景物堆砌
 3. 微表情精简：对话时"他眯起眼"就够，不要50字的面部细节
+4. 对话必须有潜台词：角色各有立场和目的，禁止"你为什么要这么做？""因为我必须保护大家。"式任务问答
+
+{hook_instruction}
 
 【格式要求】
 1. **字数限制**：只写 **{length_guide}**，是的就是这么少。
@@ -158,13 +176,16 @@ DEFAULT_PROMPTS: Dict[str, Dict[str, str]] = {
 
 【⚡ 写作要求 (Anti-AI)】
 1. 严格按照大纲的分镜顺序展开叙事，每个分镜充分展开不要概括
-2. 动作和对话驱动：用具体动作和对话推进剧情，禁止"他在心里想..."的内省段落
+2. 动作和对话驱动：用具体动作和对话推进剧情；主角面临关键选择时允许1-2句内心权衡（体现代价感），禁止长篇内省段落
 3. 微表情精简：对话时带眼神/肢体动作，一句话即可，不要展开100字的面部描写
+4. 对话必须有潜台词：角色各有立场和目的，禁止任务式问答
 
-【🚫 环境描写禁令】
-- 整章最多2句环境描写，且必须服务于剧情（如：血月暗示妖兽狂暴）
+【🚫 环境描写约束】
+- 环境描写服务于情绪与氛围（如：血月暗示妖兽狂暴），整章最多3句
 - 禁止纯风景描写、禁止形容词堆砌（如：雄伟壮观的宫殿/阴森恐怖的森林）
 - 环境描写放在每段对话/动作的间隙，不要单独成段
+
+{hook_instruction}
 
 【格式要求】
 1. **硬性字数要求**：整章必须达到 {target_words} 字。不够就加剧情细节、对话、动作。
@@ -187,7 +208,7 @@ DEFAULT_PROMPTS: Dict[str, Dict[str, str]] = {
 
 【审核标准】
 1. **逻辑性**：剧情是否连贯？有无前后矛盾？(0-100分)
-2. **AI 味检测 (关键)**：逐一检查以下 AI 典型问题：
+2. **AI 味检测**：逐一检查以下 AI 典型问题：
    - 句首词重复：是否连续使用"然而/于是/就这样/此刻/只见/与此同时..."超过2次？
    - 对话书面化：角色是否在说书面语而非口语？
    - 情绪标签化：是否用"他感到愤怒"代替了生理反应描写？
@@ -196,14 +217,22 @@ DEFAULT_PROMPTS: Dict[str, Dict[str, str]] = {
    - 情感空洞：是否缺少角色的内心真实挣扎？
    (0-100分，AI 味越重分数越低)
 3. **完成度**：是否覆盖了大纲的所有关键点？(0-100分)
+4. **阅读吸引力 (关键)**：
+   - 章末钩子：读完最后一段，读者想不想点"下一章"？
+   - 冲突升级：冲突是在升级，还是原地踏步的对称式吵架？
+   - 情绪兑现：爽点是"积累后的释放"，还是"众人震惊/全场寂静"式标签爽点？
+   - 对话角色化：角色是否各有立场与潜台词，还是任务式问答？
+   - 意外性：读者能否 100% 预测剧情走向？能则扣分。
+   (0-100分)
 
 【输出格式】
 请以 JSON 格式返回：
 {{
     "score": 75,
     "ai_flavor_score": 65,
+    "readability_score": 70,
     "comments": "指出具体的 AI 味问题（引用原文句子）",
-    "suggestions": "【去 AI 化】具体改写建议：1.将第X段的'他感到紧张'改为生理反应 2.将第Y段口语化改写 3.增加短句爆发..."
+    "suggestions": "具体改写建议：1.去AI化... 2.增强章末钩子..."
 }}"""
     },
     "fact_check": {
@@ -289,26 +318,177 @@ DEFAULT_PROMPTS: Dict[str, Dict[str, str]] = {
 - 3分: 常用工具、重要配角
 - 2分: 普通消耗品、货币
 - 1分: 杂物、路人甲 (默认)"""
+    },
+    "unified_review": {
+        "system": "你是一个多重角色的审核专家，同时担任：\n1. 严苛的网文主编（质量审核）\n2. 严谨的事实核查员（逻辑检查）\n3. RPG游戏主持人DM（状态管理）\n你的首要标准不是\"这章写得对不对\"，而是\"读者想不想继续看\"。",
+        "template": ""
+    },
+    "reader_sim": {
+        "system": "你是一个网文老读者（老书虫），追过上百本长篇网文，口味挑剔，弃书果断。你的唯一任务是诚实地回答：读完这一章，你会不会点下一章？",
+        "template": """请以一个真实网文读者的身份，读完第 {chapter_num} 章并给出你的反应。
+
+{reader_profile}
+
+【本章正文】
+{draft}
+
+【评估要求】
+1. **追读意愿 (will_continue, 1-10)**：凭直觉打分。10=熬夜也要看下一章；6=有空会看；4=可有可无；2=想弃书。
+   扣分参考：结尾没有钩子 / 冲突原地踏步 / 爽点是标签式的"众人震惊" / 对话像任务问答 / 剧情走向完全可预测。
+2. **弃书风险点 (drop_risk_points)**：指出本章让你想快进/弃书的具体位置（引用原文）。
+3. **钩子质量 (hook_quality, 1-10)**：章末是否有"新信息+风险+下一步行动"，还是"神秘黑影出现"式空钩子。
+4. **注意力 (attention, 0-100)**：读完本章后你的追读热情变化。
+5. **给作者的修改意见 (feedback_for_writer)**：如果 will_continue <= 6，给出 2-3 条提升阅读欲的具体建议（增强钩子/制造意外/升级冲突/兑现情绪债务）。
+
+【同时更新你的阅读记忆】
+- new_questions：本章新产生的、你想知道答案的问题
+- resolved_questions：本章解答了你此前的哪些疑问（从"你正在等的答案"中匹配）
+- new_debts：本章新欠你的爽点/期待（如：主角被羞辱未反击）
+- paid_debts：本章兑现了你此前的哪些期待（从"你期待兑现的爽点"中匹配）
+- new_known_facts：本章你新确知的事实
+- new_suspected_facts：本章你开始怀疑但未证实的线索
+- anticipation：读完本章，你现在最期待看到什么
+- info_gap：本章后信息差变化 {{"reader_over_hero": "...", "reader_over_villain": "..."}}
+- last_hook：本章结尾的钩子原文（一句话概括）
+
+【返回格式 (JSON Only)】
+{{
+    "will_continue": 7,
+    "continue_reason": "一句话说明为什么想/不想继续",
+    "drop_risk_points": ["..."],
+    "hook_quality": 6,
+    "attention": 70,
+    "feedback_for_writer": "...",
+    "new_questions": ["..."],
+    "resolved_questions": ["..."],
+    "new_debts": [{{"debt": "...", "urgency": 3}}],
+    "paid_debts": ["..."],
+    "new_known_facts": ["..."],
+    "new_suspected_facts": ["..."],
+    "anticipation": "...",
+    "info_gap": {{"reader_over_hero": "...", "reader_over_villain": "..."}},
+    "last_hook": "..."
+}}"""
+    },
+    "interview": {
+        "system": "你是网文创作导师。你的任务是把用户模糊的创意逐步提炼成结构化的创作约束。每次只问一个问题，给出 3 个具体选项 + 1 个'我自己描述'的自由输入选项，每个选项标注其隐含的剧情倾向和商业潜力。不要替用户做决定，只帮用户看清每个选择背后的影响。",
+        "template": """【用户原始创意】
+{raw_idea}
+
+【目标风格】
+{style}
+
+【已收集的创作约束】
+{collected_constraints}
+
+【已问问题记录】
+{question_history}
+
+【已完成的访谈主题（严禁再问这些主题！）】
+{answered_topics}
+
+【本次访谈主题（只准围绕这个主题提问）】
+{current_topic}
+
+请基于当前访谈主题，生成一个问题帮助用户把创作想法具体化。
+
+【要求】
+1. 问题必须是选择题，选项要具体、有画面感，避免抽象表述。
+2. 提供 3 个差异化选项，每个选项附带：implication（选择后对故事的影响）+ potential_score（1-5 商业/爽文潜力预估）。
+3. 选项要覆盖该主题下最常见的几种套路，并且至少有一个选项具备创新性或反套路倾向。
+4. 不要问用户"你想要什么风格"这类过于开放的问题。
+5. 【硬性约束】严禁提问【已完成主题】中的任何主题；只准围绕【本次访谈主题】提问。
+
+【返回格式 (JSON Only)】
+{{
+    "topic": "主题关键词",
+    "question": "具体问题",
+    "rationale": "为什么问这个问题（一句话说明它对故事的影响）",
+    "options": [
+        {{
+            "label": "A. 具体选项描述",
+            "value": "结构化简写",
+            "implication": "选择后对故事走向的影响",
+            "potential_score": 4
+        }}
+    ]
+}}"""
+    },
+    "multi_draft": {
+        "system": "你是网文世界观架构师。基于用户访谈得到的创作约束，一次性生成多套差异化核心设定方案。每套方案必须围绕同一批约束但走完全不同的创作方向，像三个编剧各自提出一个剧本。你不评判好坏，只提供每个方向的核心设定、潜在优势与明显风险。",
+        "template": """【用户创作约束】
+{constraints}
+
+【目标风格】
+{style}
+
+【需要生成的方案数量】
+{n}
+
+请基于同一批创作约束，生成 {n} 套差异化核心设定方案（方案 A/B/C）。
+
+【要求】
+1. 每套方案必须在【核心冲突的根源】上做出本质不同的选择（如：复仇流 vs 悬疑流 vs 反转流）。
+2. 每套方案包含：一句话核心设定（seed）、展开后的完整核心设定（hero 金手指/世界规则/反派关系）、潜在优势（strengths）、明显风险（risks）。
+3. 方案之间差异化要明显，避免只是换皮。
+
+【返回格式 (JSON Only)】
+{{
+    "variants": [
+        {{
+            "label": "A",
+            "seed": "一句话核心设定",
+            "core_setting": {{
+                "hero_backstory": "主角开局设定",
+                "gold_finger": "金手指机制与代价",
+                "world_rule": "世界核心规则",
+                "villain_relation": "反派与主角的羁绊",
+                "vol1_conflict": "第一卷核心冲突"
+            }},
+            "strengths": ["优势1", "优势2"],
+            "risks": ["风险1", "风险2"]
+        }}
+    ]
+}}"""
     }
 }
 
 
 def _load_overrides() -> Dict[str, Dict[str, str]]:
-    if os.path.exists(PROMPT_CONFIG_FILE):
-        try:
-            with open(PROMPT_CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-        except Exception as e:
-            logger.warning(f"Failed to load prompt_overrides.json: {e}")
+    """加载 overrides，带 mtime 缓存。
+
+    文件未修改时直接返回缓存；修改后自动重载。
+    """
+    global _overrides_cache
+    try:
+        mtime = os.path.getmtime(PROMPT_CONFIG_FILE)
+    except OSError:
+        # 文件不存在
+        _overrides_cache = (0.0, {})
+        return {}
+
+    cached_mtime, cached_data = _overrides_cache
+    if mtime == cached_mtime and cached_data:
+        return cached_data
+
+    try:
+        with open(PROMPT_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                _overrides_cache = (mtime, data)
+                return data
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Failed to load prompt_overrides.json: {e}")
     return {}
 
 
 def _save_overrides(data: Dict[str, Dict[str, str]]) -> None:
+    global _overrides_cache
     os.makedirs(os.path.dirname(PROMPT_CONFIG_FILE), exist_ok=True)
     with open(PROMPT_CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    # 保存后立即更新缓存，避免下次 stat+read
+    _overrides_cache = (os.path.getmtime(PROMPT_CONFIG_FILE), data)
 
 
 def get_prompt(stage: str) -> Dict[str, str]:

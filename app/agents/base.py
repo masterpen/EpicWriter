@@ -1,6 +1,7 @@
 from openai import OpenAI
 from app.core.llm_bridge import llm_bridge
 from app.core.config import settings
+from app.core.logger import logger
 import json
 
 
@@ -55,7 +56,8 @@ class BaseAgent:
                 if msg.content:
                     try:
                         return json.loads(msg.content.strip())
-                    except:
+                    except json.JSONDecodeError:
+                        logger.debug(f"[LLM Tool] tool_call content 非 JSON, 回退 raw_content (len={len(msg.content)})")
                         return {"raw_content": msg.content}
                 return None
             except Exception as e:
@@ -99,7 +101,8 @@ class BaseAgent:
                 if msg.content:
                     try:
                         return json.loads(msg.content.strip())
-                    except:
+                    except json.JSONDecodeError:
+                        logger.debug(f"[LLM Tool] async tool_call content 非 JSON, 回退 raw_content (len={len(msg.content)})")
                         return {"raw_content": msg.content}
                 return None
             except Exception as e:
@@ -112,7 +115,7 @@ class BaseAgent:
         logger.info(f"[LLM Tool] async func-call 全部失败，上层会走 json_mode 兜底")
         return None
 
-    def _call_with_stage(self, prompt, stage_override: str, model=None, temperature=1, json_mode=True):
+    def _call_with_stage(self, prompt, stage_override: str, model=None, temperature=1, json_mode=False):
         """调用 LLM 但使用指定 stage 的 system prompt（用于 brainstorm 等需要不同 system 的场景）"""
         from app.core.llm_bridge import llm_bridge
         config = llm_bridge.get_current_config()
@@ -139,7 +142,7 @@ class BaseAgent:
         logger.error(f"[LLM] model {actual_model} 3 retries exhausted")
         return ""
 
-    async def _acall_with_stage(self, prompt, stage_override: str, model=None, temperature=1, json_mode=True):
+    async def _acall_with_stage(self, prompt, stage_override: str, model=None, temperature=1, json_mode=False):
         """异步调用 LLM 但使用指定 stage 的 system prompt"""
         from app.core.llm_bridge import llm_bridge
         config = llm_bridge.get_current_config()
@@ -166,11 +169,12 @@ class BaseAgent:
         logger.error(f"[LLM] async model {actual_model} 3 retries exhausted")
         return ""
 
-    def call(self, prompt, model=None, temperature=1, json_mode=True):
+    def call(self, prompt, model=None, temperature=1, json_mode=False):
         """同步模型调用接口（向后兼容）"""
         from app.core.llm_bridge import llm_bridge
+        from app.core.logger import logger
         config = llm_bridge.get_current_config()
-        print(f"[BaseAgent] calling model: {config.model}, provider: {config.provider}")
+        logger.info(f"[BaseAgent] calling model: {config.model}, provider: {config.provider}")
         actual_model = model or config.model
         messages = [
             {"role": "system", "content": self._get_system_prompt()},
@@ -184,23 +188,22 @@ class BaseAgent:
                 client = llm_bridge.get_client()
                 response = client.chat.completions.create(**kwargs)
                 content = response.choices[0].message.content
-                print(f"[BaseAgent] response length: {len(content)}")
+                logger.info(f"[BaseAgent] response length: {len(content)}")
                 return content
             except Exception as e:
-                from app.core.logger import logger
                 logger.error(f"[LLM] model {actual_model} call failed (attempt {attempt+1}/3): {e}")
                 if attempt < 2:
                     import time
                     time.sleep(1 * (attempt + 1))
-        from app.core.logger import logger
         logger.error(f"[LLM] model {actual_model} 3 retries exhausted")
         return ""
 
-    async def acall(self, prompt, model=None, temperature=1, json_mode=True):
+    async def acall(self, prompt, model=None, temperature=1, json_mode=False):
         """异步模型调用接口（推荐，不阻塞事件循环）"""
         from app.core.llm_bridge import llm_bridge
+        from app.core.logger import logger
         config = llm_bridge.get_current_config()
-        print(f"[BaseAgent] async calling model: {config.model}, provider: {config.provider}")
+        logger.info(f"[BaseAgent] async calling model: {config.model}, provider: {config.provider}")
         actual_model = model or config.model
         messages = [
             {"role": "system", "content": self._get_system_prompt()},
@@ -214,15 +217,13 @@ class BaseAgent:
                 client = llm_bridge.get_async_client()
                 response = await client.chat.completions.create(**kwargs)
                 content = response.choices[0].message.content
-                print(f"[BaseAgent] async response length: {len(content)}")
+                logger.info(f"[BaseAgent] async response length: {len(content)}")
                 return content
             except Exception as e:
-                from app.core.logger import logger
                 logger.error(f"[LLM] async model {actual_model} call failed (attempt {attempt+1}/3): {e}")
                 if attempt < 2:
                     import asyncio
                     await asyncio.sleep(1 * (attempt + 1))
-        from app.core.logger import logger
         logger.error(f"[LLM] async model {actual_model} 3 retries exhausted")
         return ""
 
