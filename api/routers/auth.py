@@ -1,11 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
-from typing import Optional
 import hashlib
+import hmac
+import secrets
+import uuid
 import jwt
 from datetime import datetime, timedelta
 from app.core.config import settings
+from app.core.database import db
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
@@ -35,14 +38,28 @@ class TokenResponse(BaseModel):
     user: UserResponse
 
 # =======================
-# Helpers
+# Password Helpers (PBKDF2-HMAC-SHA256 + per-user salt)
 # =======================
 
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+_PBKDF2_ITERATIONS = 200_000  # OWASP 2023 推荐
 
-def verify_password(password: str, hashed: str) -> bool:
-    return hash_password(password) == hashed
+def hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
+    """返回 (password_hash, salt)。salt 为 None 时自动生成。"""
+    if salt is None:
+        salt = secrets.token_hex(16)
+    derived = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), _PBKDF2_ITERATIONS
+    )
+    return derived.hex(), salt
+
+def verify_password(password: str, password_hash: str, salt: str) -> bool:
+    """恒定时间比较，避免计时攻击"""
+    derived, _ = hash_password(password, salt)
+    return hmac.compare_digest(derived, password_hash)
+
+# =======================
+# Token Helpers
+# =======================
 
 def create_token(user_id: str, username: str) -> str:
     expire = datetime.utcnow() + timedelta(hours=settings.JWT_EXPIRE_HOURS)
@@ -62,65 +79,61 @@ def decode_token(token: str) -> dict:
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# Simple in-memory user store (replace with database in production)
-USERS_DB: dict = {}
-
 # =======================
 # Routes
 # =======================
 
 @router.post("/register", response_model=TokenResponse)
 def register(user: UserCreate):
-    user_id = hashlib.md5(user.username.encode()).hexdigest()[:12]
-    
-    if user_id in USERS_DB:
+    # 密码强度校验
+    if len(user.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    user_id = str(uuid.uuid4())
+    password_hash, salt = hash_password(user.password)
+
+    created = db.create_user(
+        user_id=user_id,
+        username=user.username,
+        email=user.email,
+        password_hash=password_hash,
+        salt=salt,
+    )
+    if not created:
         raise HTTPException(status_code=400, detail="Username already exists")
-    
-    hashed_pw = hash_password(user.password)
-    
-    USERS_DB[user_id] = {
-        "user_id": user_id,
-        "username": user.username,
-        "email": user.email,
-        "password": hashed_pw
-    }
-    
+
     token = create_token(user_id, user.username)
-    
     return TokenResponse(
         access_token=token,
         user=UserResponse(
             user_id=user_id,
             username=user.username,
-            email=user.email
+            email=user.email,
         )
     )
 
 @router.post("/login", response_model=TokenResponse)
 def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user_id = hashlib.md5(form_data.username.encode()).hexdigest()[:12]
-    
-    if user_id not in USERS_DB:
+    user_data = db.get_user_by_username(form_data.username)
+    if not user_data:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password"
         )
-    
-    user_data = USERS_DB[user_id]
-    if not verify_password(form_data.password, user_data["password"]):
+
+    if not verify_password(form_data.password, user_data["password_hash"], user_data["salt"]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password"
         )
-    
-    token = create_token(user_id, user_data["username"])
-    
+
+    token = create_token(user_data["user_id"], user_data["username"])
     return TokenResponse(
         access_token=token,
         user=UserResponse(
-            user_id=user_id,
+            user_id=user_data["user_id"],
             username=user_data["username"],
-            email=user_data["email"]
+            email=user_data["email"],
         )
     )
 
@@ -128,13 +141,13 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
 def get_current_user(token: str = Depends(oauth2_scheme)):
     payload = decode_token(token)
     user_id = payload.get("sub")
-    
-    if user_id not in USERS_DB:
+
+    user_data = db.get_user_by_id(user_id)
+    if not user_data:
         raise HTTPException(status_code=404, detail="User not found")
-    
-    user_data = USERS_DB[user_id]
+
     return UserResponse(
-        user_id=user_id,
+        user_id=user_data["user_id"],
         username=user_data["username"],
-        email=user_data["email"]
+        email=user_data["email"],
     )

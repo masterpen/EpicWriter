@@ -195,5 +195,6 @@ class LLMBridge:
 llm_bridge = LLMBridge()
 try:
     llm_bridge._try_load_from_db()
-except:
-    pass
+except Exception as e:
+    from app.core.logger import logger
+    logger.warning(f"[LLMBridge] 初始化从数据库加载配置失败: {e}")

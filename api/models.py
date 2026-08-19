@@ -24,7 +24,7 @@ class BookListResponse(BaseModel):
 class GenesisRequest(BaseModel):
     idea: str = Field(..., description="Core idea or concept")
     style: str = Field(..., description="Novel style/genre")
-    est_chapters: int = Field(100, ge=10, le=2000)
+    target_chapters: int = Field(100, ge=10, le=2000)
 
 class WorldConfigRequest(BaseModel):
     intro: Optional[str] = None
@@ -64,7 +64,7 @@ class WorkflowResponse(BaseModel):
 class OutlineUpdateRequest(BaseModel):
     thread_id: str
     chapter_title: str
-    scenes: List[str]
+    scenes: List[Any]
     style: str
 
 # =======================
@@ -96,3 +96,31 @@ class ChapterArchiveRequest(BaseModel):
     summary: str
     character_updates: List[CharacterStatusUpdate]
     new_entities: List[EntityRegister]
+
+# =======================
+# Creative Interview Models (Phase 1)
+# =======================
+
+class InterviewStartRequest(BaseModel):
+    raw_idea: str = Field(..., description="用户的原始创作想法")
+    style: str = Field("男频-热血玄幻", description="目标风格")
+
+class InterviewAnswerPayload(BaseModel):
+    option_value: Optional[str] = Field(None, description="选中的选项 value")
+    free_input: Optional[str] = Field(None, description="用户自由填写内容")
+
+class InterviewAnswerRequest(BaseModel):
+    question_id: str = Field(..., description="题目 ID")
+    answer: Optional[InterviewAnswerPayload] = Field(None, description="回答内容")
+
+class VariantGenerateRequest(BaseModel):
+    constraints: Dict[str, Any] = Field(default_factory=dict, description="访谈得到的创作约束")
+    style: str = Field("男频-热血玄幻", description="目标风格")
+    n: int = Field(3, ge=2, le=5, description="方案数量")
+
+class VariantDecideRequest(BaseModel):
+    decision: str = Field(..., description="choose / merge / regenerate / freeform")
+    chosen: Optional[str] = Field(None, description="选中的方案 label，如 A")
+    merge: Optional[List[str]] = Field(None, description="融合的方案 label 列表，如 ['A','B']")
+    freeform_data: Optional[Dict[str, Any]] = Field(None, description="自由输入的核心设定")
+    total_chapters: int = Field(100, ge=10, le=2000, description="目标篇幅")

@@ -1,7 +1,6 @@
-import json
-import re
 import asyncio
 from app.agents.base import BaseAgent
+from app.core.json_utils import parse_llm_json
 
 class MaintainerAgent(BaseAgent):
     def __init__(self):
@@ -84,20 +83,12 @@ class MaintainerAgent(BaseAgent):
         """
         
         response = self.call(prompt, json_mode=True)
-        
-        clean_json = response.replace("```json", "").replace("```", "").strip()
-        
-        try:
-            return json.loads(clean_json)
-        except:
-            try:
-                match = re.search(r'\{[\s\S]*\}', response)
-                if match:
-                    return json.loads(match.group(0))
-            except:
-                pass
+
+        default = {"summary": "解析错误", "character_updates": {}, "new_entities": []}
+        result = parse_llm_json(response, default=default)
+        if result is None or result == default:
             print(f"❌ 解析失败: {response}")
-            return {"summary": "解析错误", "character_updates": {}, "new_entities": []}
+        return result
 
     async def aanalyze_status_change(self, draft, current_tags_dict, is_volume_end=False, next_vol_title="", chapter_num=1, hero_name="主角"):
         """异步版状态分析 — 支持卷收尾总结"""
@@ -159,17 +150,9 @@ class MaintainerAgent(BaseAgent):
         """
         
         response = await self.acall(prompt, json_mode=True)
-        
-        clean_json = response.replace("```json", "").replace("```", "").strip()
-        
-        try:
-            return json.loads(clean_json)
-        except:
-            try:
-                match = re.search(r'\{[\s\S]*\}', response)
-                if match:
-                    return json.loads(match.group(0))
-            except:
-                pass
+
+        default = {"summary": "解析错误", "character_updates": {}, "new_entities": []}
+        result = parse_llm_json(response, default=default)
+        if result is None or result == default:
             print(f"❌ 解析失败: {response}")
-            return {"summary": "解析错误", "character_updates": {}, "new_entities": []}
+        return result

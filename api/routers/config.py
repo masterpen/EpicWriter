@@ -404,7 +404,8 @@ def get_prompt_meta():
                 "description": "逐分镜生成正文内容（分镜模式）",
                 "variables": ["style", "writer_persona", "hero_profile", "opening_guide",
                               "world_constraints", "feedback_instruction", "planned_title",
-                              "outline", "scene_index", "total_scenes", "scene", "length_guide"]
+                              "outline", "scene_index", "total_scenes", "scene", "length_guide",
+                              "hook_instruction"]
             },
             {
                 "key": "write_direct",
@@ -412,7 +413,7 @@ def get_prompt_meta():
                 "description": "根据大纲一次性生成完整章节（直出模式）",
                 "variables": ["style", "writer_persona", "hero_profile", "opening_guide",
                               "world_constraints", "feedback_instruction", "planned_title",
-                              "outline", "target_words"]
+                              "outline", "target_words", "hook_instruction"]
             },
             {
                 "key": "review",
@@ -431,6 +432,18 @@ def get_prompt_meta():
                 "label": "状态维护 (Maintainer)",
                 "description": "分析正文提取角色状态变更和新实体",
                 "variables": ["current_tags_dict", "draft", "hero_name"]
+            },
+            {
+                "key": "unified_review",
+                "label": "统一审核 (Unified Review)",
+                "description": "质量评分+事实核查+状态维护三合一（system 生效，template 由代码内联构建）",
+                "variables": []
+            },
+            {
+                "key": "reader_sim",
+                "label": "读者模拟 (Reader Simulation)",
+                "description": "模拟真实读者的追读意愿，并产出 ReaderState 增量（新谜团/情绪债务/信息差/钩子）",
+                "variables": ["chapter_num", "reader_profile", "draft"]
             }
         ]
     }

@@ -12,11 +12,15 @@
 
 import os
 import json
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
 from app.core.logger import logger
 
 STYLE_CARDS_DIR = "data/style_cards"
+
+# 风格卡缓存：name -> (mtime, StyleCard)
+# 避免每次 get_writer_persona / get_few_shot_examples 都读文件
+_style_card_cache: Dict[str, Tuple[float, "StyleCard"]] = {}
 
 
 # ==================================================================
@@ -175,19 +179,32 @@ def save_style_card(card: StyleCard) -> None:
     filepath = os.path.join(STYLE_CARDS_DIR, f"{card.name}.json")
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(card.model_dump(), f, ensure_ascii=False, indent=2)
+    # 保存后立即更新缓存
+    _style_card_cache[card.name] = (os.path.getmtime(filepath), card)
     logger.info(f"[StyleSystem] Saved style card: {card.name}")
 
 
 def load_style_card(name: str) -> Optional[StyleCard]:
-    """加载风格卡"""
+    """加载风格卡，带 mtime 缓存。文件未修改时直接返回缓存。"""
     filepath = os.path.join(STYLE_CARDS_DIR, f"{name}.json")
-    if not os.path.exists(filepath):
+    try:
+        mtime = os.path.getmtime(filepath)
+    except OSError:
+        # 文件不存在，清理可能存在的旧缓存
+        _style_card_cache.pop(name, None)
         return None
+
+    cached = _style_card_cache.get(name)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return StyleCard(**data)
-    except Exception as e:
+        card = StyleCard(**data)
+        _style_card_cache[name] = (mtime, card)
+        return card
+    except (json.JSONDecodeError, OSError, ValueError) as e:
         logger.warning(f"[StyleSystem] Failed to load style card '{name}': {e}")
         return None
 
@@ -207,6 +224,7 @@ def delete_style_card(name: str) -> bool:
     filepath = os.path.join(STYLE_CARDS_DIR, f"{name}.json")
     if os.path.exists(filepath):
         os.remove(filepath)
+        _style_card_cache.pop(name, None)  # 同步清理缓存
         logger.info(f"[StyleSystem] Deleted style card: {name}")
         return True
     return False
@@ -328,6 +346,103 @@ LEGACY_STYLE_DIMENSIONS = {
         "whitespace_threshold": "medium",
     },
 }
+
+
+# ==================================================================
+# 风格列表单一来源 (Single Source of Truth)
+# 所有模块（前端硬编码、WorldBuilder 约束、迁移工具）都应以这里为准
+# ==================================================================
+
+# 风格下拉选项：value = 内部 key，label = 展示名，desc = 简短说明
+LEGACY_STYLE_OPTIONS = [
+    {"value": "男频-热血玄幻", "label": "⚔️ 热血玄幻", "desc": "高燃战斗，逆天改命"},
+    {"value": "男频-系统数据", "label": "📊 系统数据", "desc": "面板升级，数据为王"},
+    {"value": "男频-诡秘智斗", "label": "🔮 诡秘智斗", "desc": "悬疑推理，步步为营"},
+    {"value": "男频-稳健苟道", "label": "🛡️ 稳健苟道", "desc": "稳扎稳打，长命百岁"},
+    {"value": "男频-无敌碾压", "label": "👑 无敌碾压", "desc": "开局巅峰，横推一切"},
+    {"value": "男频-末世/无限流", "label": "☢️ 末世废土", "desc": "末日求生，重建文明"},
+    {"value": "男频-历史权谋", "label": "🏛️ 历史权谋", "desc": "朝堂博弈，权倾天下"},
+    {"value": "女频-古言权谋", "label": "🌸 古言权谋", "desc": "宫廷争斗，凤仪天下"},
+    {"value": "女频-现言救赎", "label": "💝 现言救赎", "desc": "都市情缘，温暖治愈"},
+]
+
+# WorldBuilder 流派约束：key 匹配 LEGACY_STYLE_OPTIONS.value
+LEGACY_STYLE_CONSTRAINTS = {
+    "男频-热血玄幻": """
+    【流派强约束：热血玄幻】
+    1. **金手指必须是"成长型"或"老爷爷型"**。能让废柴主角快速逆袭。
+    2. **力量体系必须强调"破坏力"**。等级森严，一级压死人。
+    3. **核心冲突必须是"莫欺少年穷"**。主角开局必须被轻视、退婚或羞辱。
+    """,
+    "男频-系统数据": """
+    【流派强约束：系统数据流】
+    1. **金手指必须是可视化的"系统面板"**。必须具备"数据化解析"、"任务发布"或"加点升级"功能。
+    2. **力量体系必须数值化**。例如：战斗力、灵力值、熟练度。
+    3. **世界观要有游戏感**。例如：杀怪掉宝、副本机制、排行榜。
+    """,
+    "男频-诡秘智斗": """
+    【流派强约束：诡秘智斗】
+    1. **金手指必须有巨大的副作用/代价**。例如：使用力量会扣除理智、寿命或引来不可名状的注视。
+    2. **力量体系必须基于"规则"或"扮演"**。而不是单纯的比谁拳头大。
+    3. **世界观必须充满谜团**。神明是疯狂的，历史是断层的。
+    """,
+    "男频-稳健苟道": """
+    【流派强约束：稳健苟道】
+    1. **金手指必须是辅助生存型**。例如：危机预感、长生不老、属性隐藏、模拟未来。严禁给主角"嘲讽脸"系统。
+    2. **主角性格必须是"被迫害妄想症"**。只有在绝对安全（碾压十个境界）时才出手。
+    """,
+    "男频-无敌碾压": """
+    【流派强约束：无敌碾压】
+    1. **主角开局即巅峰**。金手指不需要升级，而是"解封"或"满级账号"。
+    2. **核心爽点是"扮猪吃虎"**。反派越嚣张，死得越快。
+    """,
+    "男频-末世/无限流": """
+    【流派强约束：末世废土】
+    1. **金手指必须与"物资"或"生存"相关**。例如：无限空间、暴击掉落、避难所系统。
+    2. **力量体系是次要的，资源才是核心**。世界观必须极其残酷，人吃人。
+    """,
+    "男频-历史权谋": """
+    【流派强约束：历史权谋】
+    1. **金手指不能太魔幻**。最好是"现代知识"、"图书馆"或"读心术"，严禁出现飞天遁地。
+    2. **反派不是一个人，而是一个势力**。核心冲突是理念之争或利益分配。
+    """,
+    "女频-古言权谋": """
+    【流派强约束：女频情感】
+    1. **金手指服务于"魅力"或"关系"**。例如：万人迷光环、读心术、锦鲤运气。
+    2. **反派通常是情敌、恶毒亲戚或主角的心魔**。
+    3. **力量体系不重要**，重要的是情感链接和身份地位。
+    """,
+    "女频-现言救赎": """
+    【流派强约束：现言救赎】
+    1. **金手指服务于"魅力"或"关系"**。例如：万人迷光环、读心术、锦鲤运气。
+    2. **反派通常是情敌、恶毒亲戚或主角的心魔**。
+    3. **力量体系不重要**，重要的是情感链接和身份地位。
+    """,
+}
+
+
+def get_style_constraint(style: str) -> str:
+    """根据风格 key 返回 WorldBuilder 流派约束，未知风格返回标准约束"""
+    if style in LEGACY_STYLE_CONSTRAINTS:
+        return LEGACY_STYLE_CONSTRAINTS[style]
+    # 兜底：关键词模糊匹配（兼容旧硬编码逻辑）
+    if "系统" in style or "数据" in style:
+        return LEGACY_STYLE_CONSTRAINTS["男频-系统数据"]
+    if "热血" in style:
+        return LEGACY_STYLE_CONSTRAINTS["男频-热血玄幻"]
+    if "诡秘" in style or "智斗" in style:
+        return LEGACY_STYLE_CONSTRAINTS["男频-诡秘智斗"]
+    if "苟道" in style or "稳健" in style:
+        return LEGACY_STYLE_CONSTRAINTS["男频-稳健苟道"]
+    if "无敌" in style:
+        return LEGACY_STYLE_CONSTRAINTS["男频-无敌碾压"]
+    if "末世" in style:
+        return LEGACY_STYLE_CONSTRAINTS["男频-末世/无限流"]
+    if "权谋" in style or "历史" in style:
+        return LEGACY_STYLE_CONSTRAINTS["男频-历史权谋"]
+    if "女频" in style:
+        return LEGACY_STYLE_CONSTRAINTS["女频-古言权谋"]
+    return "【标准约束】设计一个逻辑自洽的网文世界，金手指要足够强力。"
 
 
 def migrate_legacy_style(name: str, legacy_persona: str, legacy_few_shot: str = "") -> StyleCard:

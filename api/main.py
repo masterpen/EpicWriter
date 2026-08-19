@@ -2,7 +2,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from api.routers import books, workflow, auth, config, styles
 from app.core.config import settings
-import os
 
 
 app = FastAPI(
@@ -12,8 +11,7 @@ app = FastAPI(
 )
 
 # CORS - restrict in production
-env = os.getenv("APP_ENV", "development")
-if env == "production":
+if settings.APP_ENV == "production":
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["https://yourdomain.com"],

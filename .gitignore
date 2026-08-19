@@ -35,6 +35,9 @@ __pycache__/
 venv/
 .venv/
 *.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
 
 # ======================
 # IDE & Editor
@@ -72,3 +75,10 @@ test_logic.py
 ~$*.docx
 *.txt
 paper_*.md
+
+# ======================
+# Runtime data (运行时生成，不入库)
+# ======================
+data/*.sqlite
+data/config/
+data/style_cards/*.json

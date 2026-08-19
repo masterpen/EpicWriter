@@ -1,0 +1,39 @@
+# 版本控制与 IDE
+.git
+.gitignore
+.vscode
+.idea
+
+# 前端（独立构建，不进后端镜像）
+src
+node_modules
+*.log
+npm-debug.log*
+
+# 构建产物
+dist
+build
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# 运行时数据与日志
+logs
+data
+*.sqlite
+*.db
+
+# 环境与密钥（绝不进镜像）
+.env
+.env.*
+!.env.example
+
+# 容器与本地配置
+docker-compose.yml
+Dockerfile*
+.dockerignore
+
+# 文档
+README.md
+*.md

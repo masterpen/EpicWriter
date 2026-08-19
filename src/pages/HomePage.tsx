@@ -7,16 +7,18 @@ import { Card } from '@/components/ui/Card';
 import { Navigation } from '@/components/ui/Navigation';
 import { 
   BookOpen, Plus, Sparkles, Trash2, ArrowRight, Loader2, 
-  Wand2, Feather, Zap, Clock, Tag
+  Wand2, Feather, Zap, Clock, Tag, MessageCircleQuestion
 } from 'lucide-react';
 
+// 注意：风格列表的单一来源 (SSOT) 在后端 app/core/style_system.py 的 LEGACY_STYLE_OPTIONS
+// 如需新增/修改风格，请同步更新后端 SSOT 和此处
 const STYLE_OPTIONS = [
   { value: "男频-热血玄幻", label: "⚔️ 热血玄幻", desc: "高燃战斗，逆天改命" },
   { value: "男频-系统数据", label: "📊 系统数据", desc: "面板升级，数据为王" },
   { value: "男频-诡秘智斗", label: "🔮 诡秘智斗", desc: "悬疑推理，步步为营" },
   { value: "男频-稳健苟道", label: "🛡️ 稳健苟道", desc: "稳扎稳打，长命百岁" },
   { value: "男频-无敌碾压", label: "👑 无敌碾压", desc: "开局巅峰，横推一切" },
-  { value: "男频-末世废土", label: "☢️ 末世废土", desc: "末日求生，重建文明" },
+  { value: "男频-末世/无限流", label: "☢️ 末世废土", desc: "末日求生，重建文明" },
   { value: "男频-历史权谋", label: "🏛️ 历史权谋", desc: "朝堂博弈，权倾天下" },
   { value: "女频-古言权谋", label: "🌸 古言权谋", desc: "宫廷争斗，凤仪天下" },
   { value: "女频-现言救赎", label: "💝 现言救赎", desc: "都市情缘，温暖治愈" },
@@ -233,6 +235,29 @@ export default function HomePage() {
                   <Sparkles className="w-5 h-5" />
                   {genesisLoading ? 'AI 正在创作中…' : '启动创世纪'}
                 </Button>
+
+                <div className="relative flex items-center justify-center gap-4 py-1">
+                  <div className="flex-1 h-px bg-gray-200" />
+                  <span className="text-xs text-gray-400 whitespace-nowrap">或</span>
+                  <div className="flex-1 h-px bg-gray-200" />
+                </div>
+
+                <Button
+                  type="button"
+                  variant="gradient"
+                  size="lg"
+                  className="w-full"
+                  onClick={() => navigate('/interview', {
+                    state: { rawIdea: idea, style: selectedStyle }
+                  })}
+                >
+                  <MessageCircleQuestion className="w-5 h-5" />
+                  创作访谈（推荐）
+                  <ArrowRight className="w-4 h-4" />
+                </Button>
+                <p className="text-xs text-gray-400 text-center -mt-2">
+                  通过多轮选择题细化设定，比较多套方案后再生成，避免设定空泛
+                </p>
               </form>
             )}
           </Card>
