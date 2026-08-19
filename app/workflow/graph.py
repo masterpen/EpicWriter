@@ -1,11 +1,20 @@
 from typing import TypedDict, Any
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
 import asyncio
+import os
 from app.agents.core import PlannerAgent, WriterAgent
 from app.agents.reviewer import UnifiedReviewerAgent
+from app.agents.reader_simulator import ReaderSimulatorAgent
 from app.core.database import db
 from app.core.logger import logger
+from app.core.json_utils import parse_llm_json
+from app.core.reader_state import get_reader_state, save_reader_state, apply_reader_updates
+
+# Checkpoint 持久化：AsyncSqliteSaver 需在 async context 内创建，
+# 但 graph.compile 在模块顶层执行（sync），无法直接使用。
+# 当前回退到 MemorySaver（进程重启后检查点丢失）。
+# TODO: 后续可在 FastAPI lifespan 内 compile graph 以启用 AsyncSqliteSaver 持久化
+from langgraph.checkpoint.memory import MemorySaver
 
 
 # 1. 定义状态
@@ -26,11 +35,13 @@ class NovelState(TypedDict):
     review_score: int
     generate_mode: str  # "scenes" (default) or "direct"
     review_result: dict  # 完整审核结果（包含 maintainer 数据）
+    reader_reaction: dict  # 读者模拟结果（含 ReaderState 增量补丁）
 
 # 初始化 Agent
 planner = PlannerAgent()
 writer = WriterAgent()
 unified_reviewer = UnifiedReviewerAgent()
+reader_simulator = ReaderSimulatorAgent()
 
 
 async def plan_node(state: NovelState):
@@ -38,7 +49,8 @@ async def plan_node(state: NovelState):
     current_chap = state.get('chapter_num', 1)
     try:
         current_chap = int(current_chap)
-    except:
+    except (TypeError, ValueError):
+        logger.debug(f"[Planner] chapter_num 非整数 ({current_chap!r})，回退到 1")
         current_chap = 1
 
     user_intent = state.get('user_intent', '剧情自然发展')
@@ -77,14 +89,9 @@ async def write_node(state: NovelState):
     if isinstance(outline, dict) and outline.get("chapter_title"):
         planned_title = outline["chapter_title"]
     elif isinstance(outline, str):
-        try:
-            import json
-            if "{" in outline:
-                parsed = json.loads(outline.split("{")[1].split("}")[0] + "}")
-                if parsed.get("chapter_title"):
-                    planned_title = parsed["chapter_title"]
-        except:
-            pass
+        parsed = parse_llm_json(outline, default=None)
+        if isinstance(parsed, dict) and parsed.get("chapter_title"):
+            planned_title = parsed["chapter_title"]
 
     if feedback:
         logger.info(f"✍️ [Writer] 第 {state.get('review_count', 0)+1} 次重写中... (针对意见修正)")
@@ -161,8 +168,8 @@ async def unified_review_node(state: NovelState):
                         next_vol_title = volumes[idx + 1].get('title', '下一卷')
                     break
                 acc += vlen
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"[UnifiedReviewer] 检测卷末失败 (book_id={book_id}, chap={chapter_num}): {e}")
 
     if is_volume_end:
         logger.info(f"🏁 [UnifiedReviewer] 检测到卷收尾章节 (第{chapter_num}章)")
@@ -194,6 +201,56 @@ async def unified_review_node(state: NovelState):
         "review_count": state.get("review_count", 0) + 1,
         "review_result": review_result  # 保存完整结果，供后续 maintainer 使用
     }
+
+
+async def reader_sim_node(state: NovelState):
+    """
+    读者模拟节点：在质量审核之后，回答"读者会不会点下一章"。
+    - 追读意愿低 → 反馈写入 review_comments，触发重写
+    - 产出 ReaderState 增量补丁，随 state 流转，归档时落库
+    """
+    book_id = state.get('book_id')
+    current_draft = state.get('draft', "")
+    chapter_num = state.get('chapter_num', 1)
+    review_score = state.get("review_score", 70)
+
+    if not book_id or not current_draft:
+        logger.warning("⚠️ [ReaderSim] 缺少必要数据，跳过读者模拟")
+        return {"reader_reaction": {}}
+
+    reader_state = await asyncio.to_thread(get_reader_state, book_id)
+
+    logger.info(f"📖 [ReaderSim] 模拟读者阅读第 {chapter_num} 章...")
+    reaction = await reader_simulator.asimulate(
+        draft=current_draft,
+        reader_state=reader_state,
+        chapter_num=chapter_num,
+    )
+
+    will_continue = reaction.get("will_continue", 6)
+    reader_score = will_continue * 10  # 映射到百分制
+
+    # 分数融合：质量 75% + 追读意愿 25%（阅读欲望成为出版门槛的一部分）
+    blended = round(review_score * 0.75 + reader_score * 0.25)
+    logger.info(
+        f"📖 [ReaderSim] 追读意愿 {will_continue}/10 | 钩子质量 {reaction.get('hook_quality')}/10 | "
+        f"质量分 {review_score} → 融合分 {blended}"
+    )
+
+    update = {
+        "review_score": blended,
+        "reader_reaction": reaction,
+    }
+
+    # 追读意愿不达标：把读者反馈附加给 Writer，驱动"为阅读欲重写"
+    feedback = reaction.get("feedback_for_writer", "")
+    if will_continue <= 5 and feedback:
+        reason = reaction.get("continue_reason", "")
+        reader_feedback = f"【读者模拟反馈(追读意愿{will_continue}/10)】{reason} {feedback}"
+        update["review_comments"] = f"{state.get('review_comments', '')}\n{reader_feedback}".strip()
+        logger.info(f"📖 [ReaderSim] 追读意愿偏低，反馈已注入重写意见: {reader_feedback[:60]}...")
+
+    return update
 
 
 async def archive_node(state: NovelState):
@@ -247,6 +304,21 @@ async def archive_node(state: NovelState):
         if entity.get("importance", 1) >= 2:
             await asyncio.to_thread(db.add_new_entity, book_id, entity)
 
+    # 读者认知状态：应用 ReaderSim 增量补丁并落库
+    reader_reaction = state.get("reader_reaction") or {}
+    if reader_reaction:
+        try:
+            reader_state = await asyncio.to_thread(get_reader_state, book_id)
+            reader_state = apply_reader_updates(reader_state, reader_reaction, chapter_num)
+            await asyncio.to_thread(save_reader_state, book_id, reader_state)
+            logger.info(
+                f"📖 [Archive] ReaderState 已更新 | 谜团 {len(reader_state.get('mysteries', []))} 个 | "
+                f"情绪债务 {len(reader_state.get('emotional_debts', []))} 笔 | "
+                f"注意力 {reader_state.get('attention')}/100"
+            )
+        except Exception as e:
+            logger.error(f"[Archive] ReaderState 更新失败: {e}")
+
     logger.success("✅ [Archive] 归档完成！")
     return {}
 
@@ -259,6 +331,7 @@ workflow = StateGraph(NovelState)
 workflow.add_node("planner", plan_node)
 workflow.add_node("writer", write_node)
 workflow.add_node("reviewer", unified_review_node)
+workflow.add_node("reader_sim", reader_sim_node)
 workflow.add_node("archiver", archive_node)
 
 workflow.set_entry_point("planner")
@@ -300,9 +373,10 @@ workflow.add_conditional_edges(
 )
 
 workflow.add_edge("writer", "reviewer")
+workflow.add_edge("reviewer", "reader_sim")
 
 workflow.add_conditional_edges(
-    "reviewer",
+    "reader_sim",
     route_after_review,
     {
         "writer": "writer",
@@ -314,7 +388,13 @@ workflow.add_conditional_edges(
 workflow.add_edge("archiver", END)
 
 # ==========================================
-# 4. 编译
+# 4. 编译 — 使用 SQLite 持久化检查点（优先），未安装时回退到内存
+# 进程重启后可恢复进行中的工作流，长篇创作不丢进度
 # ==========================================
+_CHECKPOINT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data")
+os.makedirs(_CHECKPOINT_DIR, exist_ok=True)
+
 memory = MemorySaver()
+logger.info("[Workflow] 使用 MemorySaver（SqliteSaver 持久化待重构到 lifespan）")
+
 app = workflow.compile(checkpointer=memory)

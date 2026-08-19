@@ -1,8 +1,8 @@
-import json
-import re
 import asyncio
+import json
 from app.agents.base import BaseAgent
 from app.core.database import db
+from app.core.json_utils import parse_llm_json
 from app.core.style_system import get_style_review_prompt
 
 
@@ -17,7 +17,8 @@ class UnifiedReviewerAgent(BaseAgent):
             "你是一个多重角色的审核专家，同时担任：\n"
             "1. 严苛的网文主编（质量审核）\n"
             "2. 严谨的事实核查员（逻辑检查）\n"
-            "3. RPG游戏主持人DM（状态管理）",
+            "3. RPG游戏主持人DM（状态管理）\n"
+            "你的首要标准不是\"这章写得对不对\"，而是\"读者想不想继续看\"。",
             stage_key="unified_review"
         )
     
@@ -75,17 +76,23 @@ class UnifiedReviewerAgent(BaseAgent):
         ============================================
         【任务1：质量评分 (Reviewer)】
         ============================================
-        评分标准：
-        1. 逻辑连贯 (30%)：剧情有无矛盾
-        2. AI味检测 (30%)：句首词重复/书面语对话/情绪标签化/描写模板化/无短句爆发
-        3. 完成度 (20%)：是否覆盖大纲关键点
-        4. 风格一致性 (20%)：是否符合风格要求
+        评分标准（总分按权重加权）：
+        1. 逻辑连贯 (20%)：剧情有无矛盾
+        2. AI味检测 (20%)：句首词重复/书面语对话/情绪标签化/描写模板化/无短句爆发
+        3. 完成度 (15%)：是否覆盖大纲关键点
+        4. 风格一致性 (15%)：是否符合风格要求
+        5. 阅读吸引力 (30%) —— 本章最重要的指标：
+           - 章末钩子：读完最后一段，读者想不想点"下一章"？
+           - 冲突升级：冲突是在升级，还是原地踏步的对称式吵架？
+           - 情绪兑现：爽点是"积累后的释放"，还是"众人震惊/全场寂静"式标签爽点？
+           - 对话角色化：角色是否各有立场与潜台词，还是任务式问答？
+           - 意外性：读者能否 100% 预测剧情走向？能则扣分。
 
         AI味典型问题（务必逐条检查）：
         - "然而/于是/此刻/只见" 连续使用超过2次 → 扣分
         - 对话用书面语 ("我对你感到失望") → 扣分
         - "他感到XX" 替代了生理反应 → 扣分
-        - 环境描写超过2句 → 扣分
+        - 环境描写堆砌形容词、与剧情无关 → 扣分
 
         {style_review}
 
@@ -147,8 +154,10 @@ class UnifiedReviewerAgent(BaseAgent):
                 "score": 75,
                 "ai_flavor_score": 65,
                 "style_score": 80,
+                "readability_score": 70,
                 "comments": "具体问题（引原文句子）",
                 "style_issues": "风格不一致的具体问题",
+                "readability_issues": "阅读吸引力问题：钩子是否成立/冲突是否升级/爽点是否标签化/对话是否任务式（引用原文）",
                 "suggestions": "3-5条精确修改建议"
             }},
             "fact_check": {{
@@ -205,37 +214,11 @@ class UnifiedReviewerAgent(BaseAgent):
         return result
     
     def _parse_response(self, response: str) -> dict:
-        """鲁棒的 JSON 解析"""
-        if not response:
+        """鲁棒的 JSON 解析（委托给 app.core.json_utils）"""
+        result = parse_llm_json(response, default=None)
+        if result is None:
             return self._default_result()
-        
-        # 清理各种包裹格式
-        cleaned = response.strip()
-        for pattern in [
-            r"^```json\s*", r"^```\s*", r"```$",
-            r"^'''json\s*", r"^'''\s*", r"'''$",
-            r'^"""json\s*', r'^"""\s*', r'"""$'
-        ]:
-            cleaned = re.sub(pattern, '', cleaned, flags=re.MULTILINE)
-        
-        # 中文引号修复
-        cleaned = cleaned.replace('\u201c', '"').replace('\u201d', '"')
-        
-        # 尝试直接解析
-        try:
-            return json.loads(cleaned)
-        except:
-            pass
-        
-        # 正则提取第一个 {...}
-        try:
-            match = re.search(r'\{[\s\S]*\}', cleaned)
-            if match:
-                return json.loads(match.group(0))
-        except:
-            pass
-        
-        return self._default_result()
+        return result
     
     def _default_result(self) -> dict:
         """默认结果（解析失败时使用）"""
@@ -244,8 +227,10 @@ class UnifiedReviewerAgent(BaseAgent):
                 "score": 70,
                 "ai_flavor_score": 60,
                 "style_score": 70,
+                "readability_score": 60,
                 "comments": "JSON解析失败，默认通过",
                 "style_issues": "",
+                "readability_issues": "",
                 "suggestions": "请人工复核"
             },
             "fact_check": {

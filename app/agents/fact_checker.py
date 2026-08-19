@@ -1,8 +1,7 @@
-import json
-import re
 import asyncio
 from app.agents.base import BaseAgent
 from app.core.database import db
+from app.core.json_utils import parse_llm_json
 
 class FactCheckerAgent(BaseAgent):
     def __init__(self):
@@ -51,16 +50,13 @@ class FactCheckerAgent(BaseAgent):
         ⚠️ 如果你不确定是否算冲突 → 返回 has_conflict: false。宁可漏报！"""
         
         response = self.call(prompt, json_mode=True)
-        
-        try:
-            clean = re.sub(r'^```json\s*|```$', '', response.strip(), flags=re.MULTILINE)
-            match = re.search(r'\{[\s\S]*\}', clean)
-            if match:
-                return json.loads(match.group(0))
-        except Exception as e:
-            print(f"❌ [FactChecker] 解析失败: {e}")
-            
-        return {"has_conflict": False, "conflicts": [], "penalty_score": 0}
+
+        default = {"has_conflict": False, "conflicts": [], "penalty_score": 0}
+        result = parse_llm_json(response, default=default)
+        if result is None:
+            print(f"❌ [FactChecker] 解析失败: {response[:200]}")
+            return default
+        return result
 
     async def acheck_facts(self, draft, book_id, chapter_num):
         """异步版事实核查"""
@@ -111,24 +107,10 @@ class FactCheckerAgent(BaseAgent):
         ⚠️ 如果你不确定是否算冲突 → 返回 has_conflict: false。宁可漏报！"""
         
         response = await self.acall(prompt, json_mode=True)
-        
-        # 用与 _clean_response 同等级的鲁棒解析
-        try:
-            import re as _re
-            raw = response.strip()
-            for wrapper in [r"^```json\s*", r"^```\s*", r"```$",
-                            r"^'''json\s*", r"^'''\s*", r"'''$"]:
-                raw = _re.sub(wrapper, '', raw, flags=_re.MULTILINE)
-            # 中文引号修复
-            raw_fixed = raw.replace('\u201c', '"').replace('\u201d', '"')
-            return json.loads(raw_fixed)
-        except:
-            pass
-        try:
-            match = _re.search(r'\{[\s\S]*\}', response)
-            if match:
-                return json.loads(match.group(0).replace('\u201c', '"').replace('\u201d', '"'))
-        except:
-            pass
-        print(f"❌ [FactChecker] 解析失败: {response[:200]}")
-        return {"has_conflict": False, "conflicts": [], "penalty_score": 0}
+
+        default = {"has_conflict": False, "conflicts": [], "penalty_score": 0}
+        result = parse_llm_json(response, default=default)
+        if result is None:
+            print(f"❌ [FactChecker] 解析失败: {response[:200]}")
+            return default
+        return result

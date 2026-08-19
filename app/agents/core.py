@@ -1,23 +1,30 @@
 import json
 from app.agents.base import BaseAgent
 from app.core.database import db
+from app.core.logger import logger
 from app.core.style_system import get_writer_persona, get_few_shot_examples, get_style_review_prompt
+from app.core.json_utils import parse_llm_json, strip_code_fences
+from app.core.reader_state import get_reader_state, default_reader_state, render_for_planner
 import re
 import copy
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class PlannerAgent(BaseAgent):
-    # 🟢 Function Calling 工具定义：章节大纲结构化输出
+    # 🟢 Function Calling 工具定义：章节大纲结构化输出（Suspense Engine 版）
     PLAN_TOOL = {
         "type": "function",
         "function": {
             "name": "output_chapter_plan",
-            "description": "输出章节大纲，包含标题、分镜列表和节奏说明",
+            "description": "输出章节大纲：读者目标、角色欲望、两难选择、分镜列表、信息揭示、不可逆改变与章末钩子",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "chapter_title": {"type": "string", "description": "本章标题（双关/悬念感）"},
+                    "reader_objective": {"type": "string", "description": "本章结束后，读者应该知道了什么、还想知道什么（阅读目标）"},
+                    "character_goal": {"type": "string", "description": "本章主角的具体欲望目标（想得到/做到什么）"},
+                    "dilemma": {"type": "string", "description": "主角面临的两难/危险选择"},
+                    "choice_cost": {"type": "string", "description": "主角做出选择所付出的代价"},
                     "scenes": {
                         "type": "array",
                         "minItems": 2,
@@ -33,9 +40,12 @@ class PlannerAgent(BaseAgent):
                             "required": ["beat_type", "plot_summary", "key_info_reveal", "emotion_goal"]
                         }
                     },
+                    "information_reveal": {"type": "string", "description": "本章揭示的核心信息，以及向谁揭示（读者/主角/双方）"},
+                    "irreversible_change": {"type": "string", "description": "本章结束后不可逆的改变（拒绝一切照旧）"},
+                    "chapter_hook": {"type": "string", "description": "章末钩子 = 新信息 + 风险/悬念 + 下一步行动方向"},
                     "pacing_note": {"type": "string", "description": "本章节奏说明（如何分配详略，哪里快哪里慢）"}
                 },
-                "required": ["chapter_title", "scenes", "pacing_note"]
+                "required": ["chapter_title", "character_goal", "scenes", "chapter_hook", "pacing_note"]
             }
         }
     }
@@ -112,49 +122,13 @@ class PlannerAgent(BaseAgent):
                 # 如果没找到，可能整个 dict 就是其中一个选项？（不太可能，但为了防崩）
                 return [response]
 
-            # 3. 如果是字符串，进行暴力提取
+            # 3. 如果是字符串，用统一工具解析（提取数组）
             if isinstance(response, str):
-                import json
-                import re
-                
-                text = response.strip()
-                
-                # A. 尝试直接解析
-                try:
-                    parsed = json.loads(text)
-                    if isinstance(parsed, list): return parsed
-                    if isinstance(parsed, dict) and "options" in parsed: return parsed["options"]
-                except:
-                    pass
-                
-                # B. 尝试清理 JSON 字符串中的中文引号问题
-                try:
-                    # 替换中文引号为英文引号，处理可能的格式问题
-                    cleaned_text = text.replace('"', '"').replace('"', '"')
-                    parsed = json.loads(cleaned_text)
-                    if isinstance(parsed, list): return parsed
-                    if isinstance(parsed, dict) and "options" in parsed: return parsed["options"]
-                except:
-                    pass
-                
-                # C. 暴力正则提取方括号 [...] 内容
-                # re.DOTALL 让 . 可以匹配换行符
-                match = re.search(r'\[.*\]', text, re.DOTALL)
-                if match:
-                    try:
-                        json_str = match.group(0)
-                        return json.loads(json_str)
-                    except:
-                        # 如果失败，尝试更宽松的提取
-                        pass
-                
-                # D. 尝试提取 ```json 代码块
-                code_block_match = re.search(r'```json\s*(\[[\s\S]*\])\s*```', text)
-                if code_block_match:
-                    try:
-                        return json.loads(code_block_match.group(1))
-                    except:
-                        pass
+                parsed = parse_llm_json(response, default=None, extract_array=True)
+                if isinstance(parsed, list):
+                    return parsed
+                if isinstance(parsed, dict) and "options" in parsed:
+                    return parsed["options"]
 
         except Exception as e:
             print(f"❌ 灵感生成解析失败: {e} | 原始返回: {response}")
@@ -211,7 +185,16 @@ class PlannerAgent(BaseAgent):
         })
         
         response = await self._acall_with_stage(prompt, stage_override="brainstorm", json_mode=True)
-        
+
+        # LLM 调用失败（重试耗尽）会返回空字符串，此时应抛出明确异常而非返回假方案
+        if not response or not response.strip():
+            from app.core.llm_bridge import llm_bridge
+            cfg = llm_bridge.get_current_config()
+            raise RuntimeError(
+                f"LLM 调用失败（模型 {cfg.model} / provider {cfg.provider.value}），"
+                f"请检查 API Key、base_url 和模型名是否正确配置。"
+            )
+
         try:
             if isinstance(response, list):
                 return response
@@ -221,32 +204,38 @@ class PlannerAgent(BaseAgent):
                         return response[key]
                 return [response]
             if isinstance(response, str):
-                text = response.strip()
-                try:
-                    parsed = json.loads(text)
-                    if isinstance(parsed, list): return parsed
-                    if isinstance(parsed, dict) and "options" in parsed: return parsed["options"]
-                except:
-                    pass
-                match = re.search(r'\[.*\]', text, re.DOTALL)
-                if match:
-                    try:
-                        return json.loads(match.group(0))
-                    except:
-                        pass
+                parsed = parse_llm_json(response, default=None, extract_array=True)
+                if isinstance(parsed, list):
+                    return parsed
+                if isinstance(parsed, dict):
+                    # 支持 {"option_a": {...}, "option_b": {...}, ...} 格式
+                    option_keys = [k for k in parsed if k.lower().startswith("option")]
+                    if option_keys:
+                        result = []
+                        for k in sorted(option_keys):
+                            val = parsed[k]
+                            if isinstance(val, dict):
+                                opt_label = k.replace("_", " ").replace("option", "").strip().upper() or "A"
+                                val.setdefault("option", opt_label)
+                                result.append(val)
+                        if result:
+                            return result
+                    # 支持 {"options": [...]} 格式
+                    if "options" in parsed:
+                        return parsed["options"]
         except Exception as e:
-            print(f"❌ 灵感生成解析失败: {e} | 原始返回: {response}")
-        
-        return [
-            {"option": "A", "title": "默认推进", "desc": "解析失败，请尝试重新生成或手动输入。", "impact": "无"},
-            {"option": "B", "title": "重试方案", "desc": "AI 返回格式异常。", "impact": "无"},
-            {"option": "C", "title": "备用方案", "desc": "请检查后台日志。", "impact": "无"}
-        ]
+            logger.warning(f"[Planner] 灵感生成解析失败: {e} | 原始返回(前200字): {str(response)[:200]}")
+
+        # JSON 解析失败但 LLM 有返回内容，返回原始文本供用户参考
+        raise RuntimeError(
+            f"LLM 返回内容无法解析为 JSON 方案列表，请尝试切换模型或调整 prompt。"
+            f"原始返回(前200字): {str(response)[:200]}"
+        )
     def create_plan(self, user_intent, chapter_num, book_id):
         print(f"\n🔍 [Planner] 正在为书[{book_id}]读取设定...")
         
-        # ===== 并行优化：6个DB查询并行执行 =====
-        with ThreadPoolExecutor(max_workers=6) as executor:
+        # ===== 并行优化：7个DB查询并行执行 =====
+        with ThreadPoolExecutor(max_workers=7) as executor:
             futures = {
                 executor.submit(db.get_world_config, book_id): "world_config",
                 executor.submit(db.get_book_plan, book_id): "book_plan",
@@ -254,17 +243,19 @@ class PlannerAgent(BaseAgent):
                 executor.submit(db.get_active_npcs, book_id): "npc_context",
                 executor.submit(db.get_prev_chapter_summary, book_id, chapter_num): "prev_summary",
                 executor.submit(db.get_volume_context, book_id, chapter_num, 5): "volume_context",
+                executor.submit(get_reader_state, book_id): "reader_state",
             }
             db_results = {}
             for future in as_completed(futures):
                 db_results[futures[future]] = future.result()
-        
+
         world_config = db_results.get("world_config", {})
         book_plan = db_results.get("book_plan")
         hero_context = db_results.get("hero_context", "（未检测到主角数据）")
         npc_context = db_results.get("npc_context", "无活跃NPC")
         prev_summary = db_results.get("prev_summary", "无（这是第一章）")
         volume_context = db_results.get("volume_context", "")
+        reader_state = db_results.get("reader_state") or default_reader_state()
         # ===== 并行优化结束 =====
         
         # =========================================================
@@ -447,8 +438,8 @@ class PlannerAgent(BaseAgent):
                         conclusion = db.get_system_config(f"volume_conclusion_{prev_vol_end_chap}")
                         if conclusion:
                             vol_conclusion_text = f"\n【📋 上一卷收尾摘要 (由归档系统自动生成)】\n{conclusion}\n\n⚠️ 请基于以上收尾摘要，确保本章与前卷自然衔接，不要遗漏未解决的伏笔。"
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"[Planner] 加载上一卷收尾摘要失败 (chap={chapter_num}): {e}")
                     
                     pacing_instruction = f"""
                     【🚀 新卷开启：{current_title} - 第 1 章】
@@ -470,7 +461,7 @@ class PlannerAgent(BaseAgent):
                     # 🔴 自动切卷逻辑 (如果你想让 AI 自动切卷，请取消下面 3 行的注释)
                     if over_count >= 2 and (current_vol_idx + 1 < len(volumes)):
                         print(f"🔄 [Planner] 溢出过多，自动切换下一卷...")
-                        db.update_book_plan_field("current_volume", current_vol_idx + 2)
+                        db.update_book_plan_field(book_id, "current_volume", current_vol_idx + 2)
                     
                     pacing_instruction = f"""
                     【🏁 分卷收尾/过渡期 - 溢出第 {over_count} 章】
@@ -524,22 +515,29 @@ class PlannerAgent(BaseAgent):
         print(opening_instruction)
 
         # ----------------------------------------------------
+        # 5.5 渲染读者认知状态指令块 (Suspense Engine 核心)
+        # ----------------------------------------------------
+        reader_block = render_for_planner(reader_state, chapter_num)
+
+        # ----------------------------------------------------
         # 6. 组装 Prompt (保持不变)
         # ----------------------------------------------------
         prompt = f"""
         任务：设计第 {chapter_num} 章的【分镜大纲】。
 
         {opening_instruction}
-        
+
         【世界观设定】
         {world_context}
-        
+
         【全书总纲】
         {plan_context}
-        
+
         >>> ⚡ 节奏控制指令 (必须严格执行) <<<
         {pacing_instruction}
-        
+
+        {reader_block}
+
         【用户意图 (最高优先级)】
         {user_intent}
         
@@ -584,6 +582,10 @@ class PlannerAgent(BaseAgent):
         请严格返回以下 JSON 格式，不要包含 Markdown 代码块标记：
         {{
             "chapter_title": "本章标题 (双关/悬念感)",
+            "reader_objective": "本章结束后，读者应该知道了什么、还想知道什么（阅读目标）",
+            "character_goal": "本章主角的具体欲望目标（他想得到/做到什么）",
+            "dilemma": "主角面临的两难/危险选择",
+            "choice_cost": "主角做出选择所付出的代价",
             "scenes": [
                 {{
                     "beat_type": "类型 (如：危机引入 / 智斗博弈 / 高潮爆发 / 盘点收获)",
@@ -598,6 +600,9 @@ class PlannerAgent(BaseAgent):
                      // 分镜 3 ...
                 }}
             ],
+            "information_reveal": "本章揭示的核心信息，以及向谁揭示（读者/主角/双方）",
+            "irreversible_change": "本章结束后不可逆的改变（拒绝一切照旧）",
+            "chapter_hook": "章末钩子 = 新信息 + 风险/悬念 + 下一步行动方向",
             "pacing_note": "本章节奏说明 (如何分配详略，哪里快哪里慢)"
         }}
         """
@@ -617,22 +622,19 @@ class PlannerAgent(BaseAgent):
         # 兜底
         raw_response = self.call(prompt, json_mode=True)
         if isinstance(raw_response, str):
-            try:
-                import json, re
-                clean = re.sub(r'^```json\s*|```$', '', raw_response.strip(), flags=re.MULTILINE)
-                match = re.search(r'\{[\s\S]*\}', clean)
-                if match:
-                    return json.loads(match.group(0))
-            except:
+            default = {"chapter_title": f"第{chapter_num}章", "scenes": [raw_response], "pacing_note": "解析失败兜底"}
+            result = parse_llm_json(raw_response, default=None)
+            if result is None:
                 print(f"❌ [Planner] JSON 解析失败，返回原始内容")
-                return {"chapter_title": f"第{chapter_num}章", "scenes": [raw_response], "pacing_note": "解析失败兜底"}
+                return default
+            return result
         return raw_response if isinstance(raw_response, dict) else {"chapter_title": f"第{chapter_num}章", "scenes": ["生成失败"], "pacing_note": "兜底"}
 
     async def acreate_plan(self, user_intent, chapter_num, book_id):
         """异步版 create_plan：DB 查询并行 + LLM 调用异步"""
         print(f"\n🔍 [Planner] 正在为书[{book_id}]读取设定 (异步)...")
         
-        # ===== 异步并行：6个DB查询 =====
+        # ===== 异步并行：7个DB查询 =====
         db_results = {}
         tasks = {
             "world_config": asyncio.to_thread(db.get_world_config, book_id),
@@ -641,11 +643,12 @@ class PlannerAgent(BaseAgent):
             "npc_context": asyncio.to_thread(db.get_active_npcs, book_id),
             "prev_summary": asyncio.to_thread(db.get_prev_chapter_summary, book_id, chapter_num),
             "volume_context": asyncio.to_thread(db.get_volume_context, book_id, chapter_num, 5),
+            "reader_state": asyncio.to_thread(get_reader_state, book_id),
         }
         results = await asyncio.gather(*tasks.values())
         for key, result in zip(tasks.keys(), results):
             db_results[key] = result
-        
+
         # 以下逻辑与 create_plan 完全相同，但使用 acall 替代 call
         world_config = db_results.get("world_config", {})
         book_plan = db_results.get("book_plan")
@@ -653,6 +656,7 @@ class PlannerAgent(BaseAgent):
         npc_context = db_results.get("npc_context", "无活跃NPC")
         prev_summary = db_results.get("prev_summary", "无（这是第一章）")
         volume_context = db_results.get("volume_context", "")
+        reader_state = db_results.get("reader_state") or default_reader_state()
         
         # 计算进度（复用逻辑）
         global_progress = 0.1
@@ -789,8 +793,8 @@ class PlannerAgent(BaseAgent):
                         conclusion = db.get_system_config(f"volume_conclusion_{prev_vol_end_chap}")
                         if conclusion:
                             vol_conclusion_text = f"\n【📋 上一卷收尾摘要 (由归档系统自动生成)】\n{conclusion}\n\n⚠️ 请基于以上收尾摘要，确保本章与前卷自然衔接，不要遗漏未解决的伏笔。"
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"[Planner] 加载上一卷收尾摘要失败 (chap={chapter_num}): {e}")
                     
                     pacing_instruction = f"""
                     【🚀 新卷开启：{current_title} - 第 1 章】
@@ -806,7 +810,7 @@ class PlannerAgent(BaseAgent):
                     over_count = local_chapter_num - target_len
                     if over_count >= 2 and (current_vol_idx + 1 < len(volumes)):
                         print(f"🔄 [Planner] 溢出过多，自动切换下一卷...")
-                        db.update_book_plan_field("current_volume", current_vol_idx + 2)
+                        db.update_book_plan_field(book_id, "current_volume", current_vol_idx + 2)
                     pacing_instruction = f"""
                     【🏁 分卷收尾/过渡期 - 溢出第 {over_count} 章】
                     ⚠️ **强制刹车**：本卷剧情必须在此处彻底终结，不要再开新支线！
@@ -843,20 +847,25 @@ class PlannerAgent(BaseAgent):
 
         print(opening_instruction)
 
+        # 读者认知状态指令块 (Suspense Engine 核心)
+        reader_block = render_for_planner(reader_state, chapter_num)
+
         prompt = f"""
         任务：设计第 {chapter_num} 章的【分镜大纲】。
 
         {opening_instruction}
-        
+
         【世界观设定】
         {world_context}
-        
+
         【全书总纲】
         {plan_context}
-        
+
         >>> ⚡ 节奏控制指令 (必须严格执行) <<<
         {pacing_instruction}
-        
+
+        {reader_block}
+
         【用户意图 (最高优先级)】
         {user_intent}
         
@@ -887,6 +896,10 @@ class PlannerAgent(BaseAgent):
         请严格返回以下 JSON 格式，不要包含 Markdown 代码块标记：
         {{
             "chapter_title": "本章标题 (双关/悬念感)",
+            "reader_objective": "本章结束后，读者应该知道了什么、还想知道什么（阅读目标）",
+            "character_goal": "本章主角的具体欲望目标（他想得到/做到什么）",
+            "dilemma": "主角面临的两难/危险选择",
+            "choice_cost": "主角做出选择所付出的代价",
             "scenes": [
                 {{
                     "beat_type": "类型",
@@ -895,6 +908,9 @@ class PlannerAgent(BaseAgent):
                     "emotion_goal": "读者读完这段应有的情绪"
                 }}
             ],
+            "information_reveal": "本章揭示的核心信息，以及向谁揭示（读者/主角/双方）",
+            "irreversible_change": "本章结束后不可逆的改变（拒绝一切照旧）",
+            "chapter_hook": "章末钩子 = 新信息 + 风险/悬念 + 下一步行动方向",
             "pacing_note": "本章节奏说明"
         }}
         """
@@ -912,14 +928,9 @@ class PlannerAgent(BaseAgent):
         # 兜底：function calling 失败时用旧版 json_mode + 正则解析
         raw_response = await self.acall(prompt, json_mode=True)
         if isinstance(raw_response, str):
-            try:
-                clean = re.sub(r'^```json\s*|```$', '', raw_response.strip(), flags=re.MULTILINE)
-                match = re.search(r'\{[\s\S]*\}', clean)
-                if match:
-                    return json.loads(match.group(0))
-            except:
-                pass
-            return {"chapter_title": f"第{chapter_num}章", "scenes": [raw_response], "pacing_note": "解析失败兜底"}
+            default = {"chapter_title": f"第{chapter_num}章", "scenes": [raw_response], "pacing_note": "解析失败兜底"}
+            result = parse_llm_json(raw_response, default=default)
+            return result if result is not None else default
         return raw_response if isinstance(raw_response, dict) else {"chapter_title": f"第{chapter_num}章", "scenes": ["生成失败"], "pacing_note": "兜底"}
 
 
@@ -1132,7 +1143,7 @@ class WriterAgent(BaseAgent):
             return examples
         # Fallback：旧 FEW_SHOT_SAMPLES
         return self.FEW_SHOT_SAMPLES.get(style, "")
-    def write_draft(self, outline, chapter_num, book_id, style="男频-热血玄幻", feedback=None, planned_title=None):
+    def write_draft(self, outline, chapter_num, book_id, style="男频-热血玄幻", feedback=None, planned_title=None, original_draft=None):
         """
         核心生成方法
         """
@@ -1151,7 +1162,10 @@ class WriterAgent(BaseAgent):
         hero_personality = hero.get('personality', '坚韧')
         hero_speech = hero.get('speech_style', '正常')
         hero_desire = hero.get('core_desire', '生存')
-        
+
+        # 🟢 计算当前位置信息
+        position_tracker = self._compute_position_tracker(chapter_num, book_id)
+
         # 🟢 2. 更新常驻人设 Prompt (必须加在这里，保证全书一致)
         appearance_instruction = ""
         if int(chapter_num) == 1:
@@ -1329,9 +1343,10 @@ class WriterAgent(BaseAgent):
             >>> {scene} <<>
             
             【⚡ 写作要求 (Anti-AI)】
-            1. 动作和对话驱动：用动作/对话推进，不要静态心理描写
-            2. 环境描写极限1句，且仅限场景开头，禁止景物堆砌
+            1. 动作和对话驱动：用动作/对话推进，避免大段静态心理描写；但主角面临关键选择时，允许1-2句内心权衡（体现代价感）
+            2. 环境描写服务于情绪与氛围，单场景不超过2句，禁止与剧情无关的景物堆砌
             3. 微表情精简：对话时"他眯起眼"就够，不要展开
+            4. 对话必须有潜台词：角色各有立场和目的，禁止任务式问答
 
             【格式要求】
             1. **字数限制**：只写 **{length_guide}**，是的就是这么少。
@@ -1353,7 +1368,7 @@ class WriterAgent(BaseAgent):
             # 温度设置：女频略高(细腻)，男频略低(逻辑)
             temp = 0.92 if "女频" in style else 0.85
             
-            scene_text = self.call(prompt, temperature=temp) 
+            scene_text = self.call(prompt, temperature=temp, json_mode=False)
             
             # 清洗废话（已内置 JSON content 提取）
             scene_text = self._clean_response(scene_text)
@@ -1422,7 +1437,8 @@ class WriterAgent(BaseAgent):
         if isinstance(world_config, str):
             try:
                 world_config = json.loads(world_config)
-            except:
+            except json.JSONDecodeError as e:
+                logger.warning(f"[Writer] world_config JSON 解析失败，回退到空字典: {e}")
                 world_config = {}
         if world_config is None:
             world_config = {}
@@ -1486,10 +1502,13 @@ class WriterAgent(BaseAgent):
         - **禁令**: 严禁提及任何超出【已知力量】等级的设定，严禁提及任何未登场的高级地图。
         """
         print(f"✍️ [Writer] 启动 (异步) | 风格: [{style}]")
-        
+
         scenes = self._split_outline(outline)
         temp = 0.92 if "女频" in style else 0.85
-        
+
+        # 🪝 提取章末钩子（Suspense Engine：大纲驱动结尾）
+        chapter_hook = self._extract_chapter_hook(outline)
+
         # ===== 核心优化：分镜异步并行生成 =====
         # 构建所有 prompt
         prompts = []
@@ -1497,11 +1516,11 @@ class WriterAgent(BaseAgent):
             length_guide = "1000字左右"
             if i == 1: length_guide = "1000字 (铺垫环境，细致入微)"
             elif i == len(scenes): length_guide = "1200字 (高潮收尾，留有悬念)"
-            
+
             prompt = f"""
             【角色设定】
             你是一名顶级的网络小说大神，目前正在连载一部 **{style}** 风格的作品。
-            
+
             {writer_persona}
             {hero_profile}
             {opening_guide}
@@ -1514,39 +1533,46 @@ class WriterAgent(BaseAgent):
             【输入数据】
             📌 **全章总纲**：
             {outline}
-            
+
             【重要】这个章节只需要写**1个小场景**，不是完整章节。
-            
+
             【当前任务 (第 {i}/{len(scenes)} 部分)】- 只需完成这部分
             只写这一个小场景：
             >>> {scene} <<<
-            
+
             【⚡ 写作要求 (Anti-AI)】
-            1. 动作和对话驱动：用动作/对话推进，不要静态心理描写
-            2. 环境描写极限1句，且仅限场景开头，禁止景物堆砌
+            1. 动作和对话驱动：用动作/对话推进，避免大段静态心理描写；但主角面临关键选择时，允许1-2句内心权衡（体现代价感）
+            2. 环境描写服务于情绪与氛围，单场景不超过2句，禁止与剧情无关的景物堆砌
             3. 微表情精简：对话时"他眯起眼"就够，不要展开
+            4. 对话必须有潜台词：角色各有立场和目的，禁止"你为什么要这么做？""因为我必须保护大家。"式任务问答
 
             【格式要求】
             1. **字数限制**：只写 **{length_guide}**，是的就是这么少。
             2. **禁止扩展**：只写当前场景，不要写任何后续内容。
             3. **立即结束**：写完这个动作就停，不准续写。
             """
-            
+
             is_last_part = (i == len(scenes))
             if is_last_part:
+                if chapter_hook:
+                    prompt += f"""
+            【🪝 章末钩子指令 (必须执行)】
+            本章结尾必须落在以下钩子上：{chapter_hook}
+            要求：钩子 = 新信息 + 风险/悬念 + 下一步行动方向。严禁"一个神秘黑影出现"式空钩子。
+            """
                 prompt += """
             【重要元数据指令】
             文章结尾请务必进行一次"状态自检"：
             如果本章主角身体状态/装备/境界发生了实质性改变，请在全文最后一行单独输出：>>>STATUS_CHANGED<<<
             否则不要输出该标记。
             """
-            
+
             prompts.append(prompt)
         
         # 并行调用所有分镜的 LLM
         print(f"   -> 🚀 并行撰写 {len(prompts)} 个分镜...")
         scene_texts = await asyncio.gather(*[
-            self.acall(p, temperature=temp) for p in prompts
+            self.acall(p, temperature=temp, json_mode=False) for p in prompts
         ])
         
         # 拼接结果
@@ -1608,7 +1634,8 @@ class WriterAgent(BaseAgent):
         if isinstance(world_config, str):
             try:
                 world_config = json.loads(world_config)
-            except:
+            except json.JSONDecodeError as e:
+                logger.warning(f"[Writer] world_config JSON 解析失败，回退到空字典: {e}")
                 world_config = {}
         if world_config is None:
             world_config = {}
@@ -1684,6 +1711,14 @@ class WriterAgent(BaseAgent):
         print(f"✍️ [Writer-Direct] 启动 (直出模式) | 风格: [{style}]")
         target_words = 4000
 
+        # 🪝 章末钩子指令（Suspense Engine：大纲驱动结尾）
+        chapter_hook = self._extract_chapter_hook(outline)
+        hook_instruction = ""
+        if chapter_hook:
+            hook_instruction = f"""【🪝 章末钩子指令 (必须执行)】
+本章结尾必须落在以下钩子上：{chapter_hook}
+要求：钩子 = 新信息 + 风险/悬念 + 下一步行动方向。严禁"一个神秘黑影出现"式空钩子。"""
+
         from app.core.prompt_config import get_prompt
         from app.core.prompt_renderer import render_prompt
         cfg = get_prompt("write_direct")
@@ -1699,11 +1734,12 @@ class WriterAgent(BaseAgent):
             "outline": str(outline),
             "target_words": str(target_words),
             "position_tracker": position_tracker,
+            "hook_instruction": hook_instruction,
         })
 
         temp = 0.92 if "女频" in style else 0.85
 
-        full_chapter = await self._acall_with_stage(prompt, stage_override="write_direct", temperature=temp)
+        full_chapter = await self._acall_with_stage(prompt, stage_override="write_direct", temperature=temp, json_mode=False)
 
         # 统一提取 content（_clean_response 已内置所有格式处理）
         full_chapter = self._clean_response(full_chapter)
@@ -1715,6 +1751,21 @@ class WriterAgent(BaseAgent):
         full_chapter = re.sub(r'\n*>>>STATUS_CHANGED<<<', '', full_chapter, flags=re.IGNORECASE).strip()
 
         return {"draft": full_chapter, "status_changed": status_changed}
+
+    @staticmethod
+    def _extract_chapter_hook(outline) -> str:
+        """从大纲中提取章末钩子（chapter_hook 字段），兼容 dict / JSON 字符串"""
+        try:
+            data = outline
+            if isinstance(outline, str):
+                data = parse_llm_json(outline, default=None)
+            if isinstance(data, dict):
+                hook = data.get("chapter_hook")
+                if isinstance(hook, str):
+                    return hook.strip()
+        except Exception:
+            pass
+        return ""
 
     def _split_outline(self, outline):
         """
@@ -1730,11 +1781,9 @@ class WriterAgent(BaseAgent):
             if isinstance(outline, dict):
                 scenes_data = outline.get("scenes", [])
             elif isinstance(outline, str):
-                # 尝试清洗一下 Markdown 标记再解析
-                import re, json
-                clean_json = re.sub(r'^```json\s*|```$', '', outline.strip(), flags=re.MULTILINE)
-                if clean_json.strip().startswith("{"):
-                    data = json.loads(clean_json)
+                # 用统一工具清洗并解析
+                data = parse_llm_json(outline, default=None)
+                if isinstance(data, dict):
                     scenes_data = data.get("scenes", [])
         except Exception as e:
             print(f"⚠️ [Writer] 大纲解析异常，转为文本处理: {e}")
@@ -1788,15 +1837,10 @@ class WriterAgent(BaseAgent):
         
         # 🟢 修复：检查大纲是否本身就是 JSON (带有 content 字段)
         if isinstance(outline, str):
-            try:
-                import re as re2
-                clean_json = re2.sub(r'^```json\s*|```$', '', outline.strip(), flags=re2.MULTILINE)
-                outline_data = json.loads(clean_json)
-                if "content" in outline_data:
-                    outline = outline_data["content"]
-                    print("   -> 从大纲 JSON 中提取了 content 字段")
-            except:
-                pass
+            outline_data = parse_llm_json(outline, default=None)
+            if isinstance(outline_data, dict) and "content" in outline_data:
+                outline = outline_data["content"]
+                print("   -> 从大纲 JSON 中提取了 content 字段")
         
         splitter_prompt = f"""
         任务：将以下小说大纲拆分为恰好 2 个独立的、连贯的写作分镜。
@@ -1810,29 +1854,23 @@ class WriterAgent(BaseAgent):
         - 只输出 2 段纯文本，使用 "|||" 作为分隔符
         - 不要输出任何其他说明
         """
-        response = self.call(splitter_prompt)
+        response = self.call(splitter_prompt, json_mode=False)
         
         # 🟢 修复：检查 LLM 返回的是否是 JSON 格式
         response_to_parse = response
         if isinstance(response, str):
-            # 尝试提取 JSON
-            try:
-                import re as re3
-                clean_json = re3.sub(r'^```json\s*|```$', '', response.strip(), flags=re3.MULTILINE)
-                if clean_json.strip().startswith("{"):
-                    json_data = json.loads(clean_json)
-                    # 检查是否有 content 字段
-                    if "content" in json_data:
-                        response_to_parse = json_data["content"]
-                        print("   -> 从 LLM 返回中提取了 content 字段")
-                    elif "scenes" in json_data:
-                        # 如果返回的是 scenes 数组，直接返回结构化结果
-                        scenes_from_llm = json_data["scenes"]
-                        formatted_parts = [f"【场景{i+1}】 {s}" for i, s in enumerate(scenes_from_llm[:2])]
-                        print(f"   -> LLM 返回了结构化 scenes: {len(formatted_parts)} 个")
-                        return formatted_parts
-            except:
-                response_to_parse = response
+            json_data = parse_llm_json(response, default=None)
+            if isinstance(json_data, dict):
+                # 检查是否有 content 字段
+                if "content" in json_data:
+                    response_to_parse = json_data["content"]
+                    print("   -> 从 LLM 返回中提取了 content 字段")
+                elif "scenes" in json_data:
+                    # 如果返回的是 scenes 数组，直接返回结构化结果
+                    scenes_from_llm = json_data["scenes"]
+                    formatted_parts = [f"【场景{i+1}】 {s}" for i, s in enumerate(scenes_from_llm[:2])]
+                    print(f"   -> LLM 返回了结构化 scenes: {len(formatted_parts)} 个")
+                    return formatted_parts
         
         cleaned = self._clean_response(response_to_parse)
         parts = cleaned.split("|||")
@@ -1858,11 +1896,9 @@ class WriterAgent(BaseAgent):
         CONTENT_KEYS = ["content", "chapter_content", "text", "body", "draft", "output", "result"]
         
         try:
-            # 清理各种包裹标记
-            cleaned = _re.sub(r'^```json\s*|^```\s*|```$', '', text.strip(), flags=_re.MULTILINE)
-            cleaned = _re.sub(r"^'''json\s*|^'''\s*|'''$", '', cleaned.strip(), flags=_re.MULTILINE)
-            cleaned = _re.sub(r'^"""json\s*|^"""\s*|"""$', '', cleaned.strip(), flags=_re.MULTILINE)
-            
+            # 清理各种包裹标记（委托给统一工具）
+            cleaned = strip_code_fences(text)
+
             if cleaned.strip().startswith("{"):
                 try:
                     data = json.loads(cleaned)
@@ -1879,13 +1915,15 @@ class WriterAgent(BaseAgent):
                                                 if k in inner and isinstance(inner[k], str):
                                                     extracted = inner[k]
                                                     break
-                                    except:
+                                    except json.JSONDecodeError:
+                                        # 内层不是合法 JSON，保留外层 extracted 原值
                                         pass
                                 break
-                except:
+                except json.JSONDecodeError:
+                    # 外层 JSON 解析失败，extracted 保持为原始 text
                     pass
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"[Writer] _extract_content JSON 提取失败，回退到原文: {e}")
         
         # 清洗常见废话前缀
         patterns = [
@@ -1923,7 +1961,8 @@ class WriterAgent(BaseAgent):
             if isinstance(val, str):
                 try:
                     safe_config[key] = json.loads(val)
-                except:
+                except json.JSONDecodeError as e:
+                    logger.debug(f"[Writer] _apply_fog_of_war: 字段 '{key}' JSON 解析失败，回退为空: {e}")
                     safe_config[key] = {} if key != 'locations' else []
             if safe_config.get(key) is None:
                 safe_config[key] = {} if key != 'locations' else []
@@ -2090,52 +2129,19 @@ class ReviewerAgent(BaseAgent):
         return self._parse_json(raw_response)
 
     def _parse_json(self, text):
-        """Robust JSON parser - handles markdown/python wrappers, Chinese punctuation, nesting"""
+        """Robust JSON parser - 委托给 app.core.json_utils"""
+        default = {"score": 70, "suggestions": "Reviewer returned invalid format, default pass."}
         if not text or not isinstance(text, str):
             return {"score": 70, "suggestions": "Empty input, default pass."}
-        
-        raw = text.strip()
-        
-        # Step 1: 清理所有已知包裹格式
-        import re as _re
-        for wrapper in [r"^```json\s*", r"^```\s*", r"```$",
-                        r"^'''json\s*", r"^'''\s*", r"'''$",
-                        r'^"""json\s*', r'^"""\s*', r'"""$']:
-            raw = _re.sub(wrapper, '', raw, flags=_re.MULTILINE)
-        raw = raw.strip()
-        
-        # Step 2: 尝试直接解析
-        try:
-            return json.loads(raw)
-        except:
-            pass
-        
-        # Step 3: 中文引号修复后解析
-        try:
-            fixed = raw.replace('\u201c', '"').replace('\u201d', '"').replace('\u2018', "'").replace('\u2019', "'")
-            return json.loads(fixed)
-        except:
-            pass
-        
-        # Step 4: 暴力正则提取第一个 {...}
-        try:
-            match = _re.search(r'\{[\s\S]*\}', raw)
-            if match:
-                candidate = match.group(0)
-                # 尝试修复中文标点
-                candidate_fixed = candidate.replace('\u201c', '"').replace('\u201d', '"')
-                return json.loads(candidate_fixed)
-        except:
-            pass
-        
-        # Step 5: fallback - log raw response for debugging
+
+        result = parse_llm_json(text, default=None)
+        if result is not None:
+            return result
+
         from app.core.logger import logger
         logger.warning(f"[Reviewer] JSON parse failed (len={len(text)}), raw={text[:200]}...")
         print(f"[Reviewer] JSON parse failed ({len(text)} chars): {text[:200]}")
-        return {
-            "score": 70,
-            "suggestions": "Reviewer returned invalid format, default pass."
-        }
+        return default
 
     async def areview_draft(self, draft, outline, chapter_num, style):
         """异步版审核"""
